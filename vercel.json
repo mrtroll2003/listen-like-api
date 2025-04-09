@@ -2,15 +2,12 @@
     "version": 2,
     "builds": [
       {
-        "comments": "Path to your main application file; // Specify the Python runtime builder",
         "src": "api/index.py",  
         "use": "@vercel/python"  
       }
     ],
     "routes": [
       {
-        
-        "comments": "// Route all incoming requests starting with /api/// to the Python function defined in api/index.py",
         "src": "/api/(.*)",
         "dest": "/api/index.py"
       }
