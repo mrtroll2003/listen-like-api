@@ -6,10 +6,12 @@ import subprocess
 import asyncio
 from pathlib import Path
 import logging
+from typing import Optional # Added for type hinting
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body # Added Body
 from fastapi.responses import JSONResponse
 import datetime
+from pydantic import BaseModel # Added for request body validation
 
 try:
     import whisper
@@ -18,6 +20,19 @@ except ImportError:
     # You might want to raise an exception or handle this more gracefully
     # depending on whether the API can function without whisper at all.
     whisper = None # Set to None so later checks fail clearly
+
+# --- Translation Setup ---
+try:
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    # Optional: Specify cache directory if needed within Vercel's writable tmp space
+    # HUGGINGFACE_CACHE = "/tmp/huggingface_cache"
+    # os.environ["HF_HOME"] = HUGGINGFACE_CACHE
+    # os.environ["TRANSFORMERS_CACHE"] = HUGGINGFACE_CACHE
+    # Path(HUGGINGFACE_CACHE).mkdir(parents=True, exist_ok=True)
+except ImportError:
+     logging.error("Hugging Face Transformers library not found. Please install it: pip install transformers sentencepiece torch")
+     AutoModelForSeq2SeqLM = None
+     AutoTokenizer = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,18 +46,82 @@ loaded_model = None
 
 def load_whisper_model():
     """Loads the Whisper model if not already loaded."""
-    global loaded_model
+    global whisper_loaded_model
     if not whisper:
         raise RuntimeError("Whisper library failed to import.")
-    if loaded_model is None:
-        logger.info(f"Loading Whisper model: {MODEL_NAME}...")
+    if whisper_loaded_model is None:
+        logger.info(f"Loading Whisper model: {WHISPER_MODEL_NAME}...")
         try:
-            loaded_model = whisper.load_model(MODEL_NAME)
+            # Consider specifying download_root if needed on Vercel /tmp
+            # whisper_loaded_model = whisper.load_model(WHISPER_MODEL_NAME, download_root="/tmp/whisper_cache")
+            whisper_loaded_model = whisper.load_model(WHISPER_MODEL_NAME)
             logger.info("Whisper model loaded successfully.")
         except Exception as e:
-            logger.error(f"Error loading Whisper model '{MODEL_NAME}': {e}", exc_info=True)
+            logger.error(f"Error loading Whisper model '{WHISPER_MODEL_NAME}': {e}", exc_info=True)
             raise RuntimeError(f"Failed to load Whisper model: {e}")
-    return loaded_model
+    return whisper_loaded_model
+
+# --- Translation Model Loading ---
+# Using a distilled NLLB model for potentially better performance/size balance
+# Other options: "facebook/mbart-large-50-many-to-many-mmt"
+TRANSLATION_MODEL_NAME = os.environ.get("TRANSLATION_MODEL", "facebook/nllb-200-distilled-600M")
+translation_model = None
+translation_tokenizer = None
+
+# Simple mapping from common language names/codes to NLLB Flores-200 codes
+# See Flores-200 codes: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
+# Add more mappings as needed
+LANGUAGE_CODE_MAP = {
+    "English": "eng_Latn",
+    "en": "eng_Latn",
+    "Spanish": "spa_Latn",
+    "es": "spa_Latn",
+    "French": "fra_Latn",
+    "fr": "fra_Latn",
+    "German": "deu_Latn",
+    "de": "deu_Latn",
+    "Chinese": "zho_Hans", # Simplified Chinese
+    "zh": "zho_Hans",
+    "Japanese": "jpn_Jpan",
+    "ja": "jpn_Jpan",
+    "Arabic": "arb_Arab",
+    "ar": "arb_Arab",
+    "Russian": "rus_Cyrl",
+    "ru": "rus_Cyrl",
+    "Hindi": "hin_Deva",
+    "hi": "hin_Deva",
+    "Korean": "kor_Hang",
+    "ko": "kor_Hang",
+    "Vietnamese": "vie_Latn",
+    "vi": "vie_Latn",
+    "Indonesian": "ind_Latn",
+    "id": "ind_Latn",
+}
+
+def get_flores_code(lang_name_or_code: str) -> Optional[str]:
+    """Gets the NLLB Flores-200 code for a given language name/code."""
+    return LANGUAGE_CODE_MAP.get(lang_name_or_code.lower())
+
+def load_translation_model_and_tokenizer():
+    """Loads the translation model and tokenizer if not already loaded."""
+    global translation_model, translation_tokenizer
+    if not AutoModelForSeq2SeqLM or not AutoTokenizer:
+         raise RuntimeError("Transformers library failed to import.")
+    if translation_model is None or translation_tokenizer is None:
+        logger.info(f"Loading translation model/tokenizer: {TRANSLATION_MODEL_NAME}...")
+        try:
+            # device_map="auto" might help distribute across resources if available
+            translation_model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL_NAME)
+            translation_tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME)
+            logger.info("Translation model/tokenizer loaded successfully.")
+        except Exception as e:
+            logger.error(f"Error loading translation model '{TRANSLATION_MODEL_NAME}': {e}", exc_info=True)
+            # Reset globals on failure to allow retry later if applicable
+            translation_model = None
+            translation_tokenizer = None
+            raise RuntimeError(f"Failed to load translation model/tokenizer: {e}")
+    return translation_model, translation_tokenizer
+
 
 # --- Helper Functions ---
 async def run_ffmpeg(input_path: str, output_path: str):
@@ -95,6 +174,11 @@ async def run_ffmpeg(input_path: str, output_path: str):
          logger.error(f"An unexpected error occurred during ffmpeg execution: {e}", exc_info=True)
          raise RuntimeError(f"Audio extraction failed: {e}")
 
+# --- Pydantic Models for Request/Response ---
+class TranslationRequest(BaseModel):
+    text: str
+    target_language: str
+    source_language: str = "en" # Default source language is English
 
 # --- API Endpoints ---
 
@@ -109,7 +193,7 @@ async def api_root():
         "whisper_model_used": MODEL_NAME
     })
 
-@app.post("/api/transcribe")
+@app.post("/api/transcribe", tags=["Transcription"])
 async def transcribe_video(request: Request, file: UploadFile = File(...)):
     """
     Receives a video file (MP4, AVI, etc.), extracts audio,
@@ -218,6 +302,82 @@ async def transcribe_video(request: Request, file: UploadFile = File(...)):
         # Ensure file stream is closed even if saving failed early
         if not file.file.closed:
              await file.close()
+
+@app.post("/api/translate", tags=["Translation"])
+async def translate_text(payload: TranslationRequest):
+    """
+    Translates text from a source language (default: English) to a target language.
+    Requires 'text' and 'target_language' in the JSON request body.
+    'target_language' should be a common name (e.g., 'Spanish', 'French') or code (e.g., 'es', 'fr').
+    """
+    if not AutoModelForSeq2SeqLM or not AutoTokenizer:
+        raise HTTPException(status_code=501, detail="Translation library not available on the server.")
+
+    try:
+        model, tokenizer = load_translation_model_and_tokenizer()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load translation model: {e}")
+
+    # --- Get Language Codes ---
+    target_lang_code = get_flores_code(payload.target_language)
+    if not target_lang_code:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported target language: '{payload.target_language}'. Please use a common name or code (e.g., 'Spanish', 'es', 'French', 'fr'). Supported codes: {list(LANGUAGE_CODE_MAP.keys())}"
+        )
+
+    source_lang_code = get_flores_code(payload.source_language)
+    if not source_lang_code:
+         # Defaulting to English if source is not provided or invalid, could raise error instead
+        logger.warning(f"Unsupported source language '{payload.source_language}'. Defaulting to English ('en').")
+        source_lang_code = "eng_Latn" # Default NLLB code for English
+
+    logger.info(f"Translation request: From '{source_lang_code}' To '{target_lang_code}'")
+
+    try:
+        # --- Prepare input for the model ---
+        tokenizer.src_lang = source_lang_code
+        # max_length can be adjusted based on expected input/output sizes
+        inputs = tokenizer(payload.text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+
+        # --- Generate translation ---
+        # Get the target language ID for forcing the decoder
+        forced_bos_token_id = tokenizer.lang_code_to_id[target_lang_code]
+
+        logger.info("Generating translation...")
+        # Use run_in_executor for the potentially CPU-bound generation task
+        loop = asyncio.get_running_loop()
+        generated_tokens = await loop.run_in_executor(
+            None, # Default thread pool executor
+            model.generate, # Function to run
+            **inputs.to(model.device), # Pass tokenized inputs (move to model device if applicable)
+            forced_bos_token_id=forced_bos_token_id, # Force target language
+            max_length=512 # Should match or exceed input max_length
+        )
+        # generated_tokens = model.generate(
+        #     **inputs.to(model.device), # Ensure tensors are on the same device as model
+        #     forced_bos_token_id=forced_bos_token_id,
+        #     max_length=512 # Adjust as needed
+        # )
+
+        # --- Decode the result ---
+        translated_text = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+        logger.info("Translation generation successful.")
+
+        return JSONResponse(content={
+            "original_text": payload.text,
+            "source_language_code": source_lang_code,
+            "target_language_code": target_lang_code,
+            "target_language_input": payload.target_language,
+            "translated_text": translated_text,
+            "model_used": TRANSLATION_MODEL_NAME
+        })
+
+    except Exception as e:
+        logger.error(f"Translation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Translation process failed: {e}")
+
+
 
 
 @app.get("/api/hello")

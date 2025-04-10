@@ -9,7 +9,7 @@ WORKDIR /app
 # RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 # It's often better to combine update, install, and clean in one RUN layer
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg build-essential \
     # Add any other system deps here, like 'build-essential' if needed by pip packages
     # Clean up apt caches to reduce image size
     && apt-get clean \
