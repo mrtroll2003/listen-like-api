@@ -61,7 +61,7 @@ async def run_ffmpeg(input_path: str, output_path: str):
     # os.chmod(ffmpeg_path, 0o755) # Gives rwxr-xr-x permissions
 
     ffmpeg_cmd = [
-        str(ffmpeg_path), # Use the specific path as a string
+        "ffmpeg", # Use the specific path as a string
         "-i", input_path,       # Input file
         "-vn",                  # Disable video recording
         "-acodec", "pcm_s16le", # Audio codec (wav)
