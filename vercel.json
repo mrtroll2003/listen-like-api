@@ -1,11 +1,23 @@
 {
     "version": 2,
+    "builds": [
+      {
+        "src": "api/index.py",
+        "use": "@vercel/python",
+        "config": {
+          "maxLambdaSize": "50mb", 
+          "buildCommand": "bash build.sh"
+        }
+      }
+    ],
     "routes": [
       {
-        "src": "/api/(.*)"
+        "src": "/api/(.*)",
+        "dest": "/api/index.py"
       }
     ],
     "env": {
-        "WHISPER_MODEL": "base"
-     }
+      "WHISPER_MODEL": "base",
+      "TRANSLATION_MODEL": "facebook/nllb-200-distilled-600M"
+    }
   }

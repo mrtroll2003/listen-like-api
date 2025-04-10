@@ -126,50 +126,55 @@ def load_translation_model_and_tokenizer():
 # --- Helper Functions ---
 async def run_ffmpeg(input_path: str, output_path: str):
     """
-    Extracts audio from video using ffmpeg asynchronously.
+    Extracts audio from video using the ffmpeg binary copied during build.
     """
-    # Construct the path to the bundled ffmpeg relative to this script file
-    script_dir = Path(__file__).parent.resolve() # api/ directory
-    project_root = script_dir.parent          # Project root directory
-    ffmpeg_path = project_root / "bin" / "ffmpeg" # Path object to bin/ffmpeg
+    # Path to the ffmpeg binary relative to this script (index.py)
+    # Since build.sh copies it to 'api/ffmpeg' and index.py is in 'api/'
+    script_dir = Path(__file__).parent.resolve()
+    ffmpeg_path = script_dir / "ffmpeg" # Should resolve to /var/task/api/ffmpeg at runtime
+
+    # Check if the copied binary exists
     if not ffmpeg_path.is_file():
-        logger.error(f"Bundled ffmpeg not found at: {ffmpeg_path}")
-        raise RuntimeError(f"ffmpeg binary missing at expected location.")
-    # You might need to explicitly make it executable again inside the function
-    # if permissions get lost, though git *should* preserve them.
-    # os.chmod(ffmpeg_path, 0o755) # Gives rwxr-xr-x permissions
+         # If this happens, the copy in build.sh likely failed or the path is wrong
+         logger.error(f"Copied ffmpeg binary not found at expected runtime location: {ffmpeg_path}")
+         # You could also try checking common system paths as a fallback, but rely on the copied one first
+         # ffmpeg_executable_fallback = "ffmpeg" # Try system path
+         raise RuntimeError(f"ffmpeg binary missing at expected location: {ffmpeg_path}. Build copy likely failed.")
+
+    # Make sure it's executable at runtime (belt and suspenders)
+    try:
+        os.chmod(ffmpeg_path, 0o755) # rwxr-xr-x
+    except Exception as e:
+        logger.warning(f"Could not set execute permission on {ffmpeg_path}: {e}. It might already be set.")
+
 
     ffmpeg_cmd = [
-        "ffmpeg", # Use the specific path as a string
-        "-i", input_path,       # Input file
-        "-vn",                  # Disable video recording
-        "-acodec", "pcm_s16le", # Audio codec (wav)
-        "-ar", "16000",         # Sample rate (recommended for Whisper)
-        "-ac", "1",             # Number of audio channels (mono)
-        "-y",                   # Overwrite output file if it exists
-        output_path,
+        str(ffmpeg_path), # Use the specific path to the copied binary
+        "-i", input_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        "-y", output_path,
     ]
 
-    logger.info(f"Running ffmpeg command: {' '.join(ffmpeg_cmd)}")
+    logger.info(f"Running copied ffmpeg command: {' '.join(ffmpeg_cmd)}")
     try:
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate() # Wait for command to finish
+        stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
             error_message = stderr.decode().strip()
-            logger.error(f"ffmpeg error (code {process.returncode}): {error_message}")
-            raise RuntimeError(f"ffmpeg failed: {error_message}")
+            logger.error(f"Copied ffmpeg error (code {process.returncode}): {error_message}")
+            raise RuntimeError(f"Copied ffmpeg failed: {error_message}")
         else:
-            logger.info("ffmpeg completed successfully.")
-            # logger.debug(f"ffmpeg stdout: {stdout.decode().strip()}") # Optional: log stdout
-            # logger.debug(f"ffmpeg stderr: {stderr.decode().strip()}") # Optional: log stderr on success
+            logger.info("Copied ffmpeg completed successfully.")
+
     except FileNotFoundError:
-         logger.error("ffmpeg command not found. Ensure ffmpeg is installed and in the system PATH.")
-         raise RuntimeError("ffmpeg is not installed or not found in PATH.")
+         # This error now specifically means the ffmpeg_path determined above wasn't found/executable
+         logger.error(f"Failed to execute ffmpeg command at path: {ffmpeg_path}")
+         raise RuntimeError(f"ffmpeg execution failed (FileNotFound at {ffmpeg_path}).")
     except Exception as e:
          logger.error(f"An unexpected error occurred during ffmpeg execution: {e}", exc_info=True)
          raise RuntimeError(f"Audio extraction failed: {e}")
