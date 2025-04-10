@@ -1,6 +1,6 @@
 # Start with an official Python base image (choose a specific version)
 # Debian-based images like 'slim-bullseye' are common and have 'apt-get'
-FROM python:3.11-slim-bullseye
+FROM python:3.12-slim-bullseye
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -9,7 +9,7 @@ WORKDIR /app
 # RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 # It's often better to combine update, install, and clean in one RUN layer
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg build-essential \
+    && apt-get install -y --no-install-recommends ffmpeg build-essential cmake \
     # Add any other system deps here, like 'build-essential' if needed by pip packages
     # Clean up apt caches to reduce image size
     && apt-get clean \
