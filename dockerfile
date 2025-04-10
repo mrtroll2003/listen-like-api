@@ -34,4 +34,5 @@ EXPOSE 8000
 # Command to run your application using Uvicorn
 # Vercel expects the app to listen on 0.0.0.0 and will map the port.
 # The entrypoint file is now relative to WORKDIR (/app)
+# Something's wrong
 CMD ["uvicorn", "api.index:app", "--host", "0.0.0.0", "--port", "8000"]
