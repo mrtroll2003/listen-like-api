@@ -15,8 +15,5 @@
         "src": "/api/(.*)",
         "dest": "api/index.py"
       }
-    ],
-    "env": {
-      "GOOGLE_API_KEY": "@google-api-key"
-    }
+    ]
   }
