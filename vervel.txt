@@ -1,9 +1,1 @@
-"comments": "Path to your main application file; // Specify the Python runtime builder",
-"comments": "// Route all incoming requests starting with /api/// to the Python function defined in api/index.py",
-  // You might want a catch-all if you intend the *entire* site
-      // to be served by this API, including the root '/':
-      // {
-      //   "src": "/(.*)",
-      //   "dest": "/api/index.py"
-      // }
-      // Choose the routing strategy that fits best. Starting with just /api/ is common.
+          // Keep maxLambdaSize, as whisper+torch can still be sizable

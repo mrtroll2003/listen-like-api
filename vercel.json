@@ -5,19 +5,18 @@
         "src": "api/index.py",
         "use": "@vercel/python",
         "config": {
-          "maxLambdaSize": "50mb", 
-          "buildCommand": "bash build.sh"
+
+          "maxLambdaSize": "50mb"
         }
       }
     ],
     "routes": [
       {
         "src": "/api/(.*)",
-        "dest": "/api/index.py"
+        "dest": "api/index.py"
       }
     ],
     "env": {
-      "WHISPER_MODEL": "base",
-      "TRANSLATION_MODEL": "facebook/nllb-200-distilled-600M"
+      "GOOGLE_API_KEY": "@google-api-key"
     }
   }

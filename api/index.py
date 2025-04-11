@@ -2,279 +2,232 @@ import os
 import sys
 import tempfile
 import shutil
-import subprocess
 import asyncio
 from pathlib import Path
 import logging
-from typing import Optional # Added for type hinting
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body # Added Body
-from fastapi.responses import JSONResponse
 import datetime
-from pydantic import BaseModel # Added for request body validation
+from typing import Optional
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# --- Library Imports ---
+try:
+    import moviepy.editor as mp
+except ImportError:
+    logging.error("MoviePy library not found. pip install moviepy")
+    mp = None
 
 try:
     import whisper
 except ImportError:
-    logging.error("OpenAI Whisper library not found. Please install it: pip install -U openai-whisper")
-    # You might want to raise an exception or handle this more gracefully
-    # depending on whether the API can function without whisper at all.
-    whisper = None # Set to None so later checks fail clearly
+    logging.error("OpenAI Whisper library not found. pip install -U openai-whisper")
+    whisper = None
 
-# --- Translation Setup ---
 try:
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-    # Optional: Specify cache directory if needed within Vercel's writable tmp space
-    # HUGGINGFACE_CACHE = "/tmp/huggingface_cache"
-    # os.environ["HF_HOME"] = HUGGINGFACE_CACHE
-    # os.environ["TRANSFORMERS_CACHE"] = HUGGINGFACE_CACHE
-    # Path(HUGGINGFACE_CACHE).mkdir(parents=True, exist_ok=True)
+    import google.generativeai as genai
 except ImportError:
-     logging.error("Hugging Face Transformers library not found. Please install it: pip install transformers sentencepiece torch")
-     AutoModelForSeq2SeqLM = None
-     AutoTokenizer = None
+    logging.error("Google Generative AI library not found. pip install google-generativeai")
+    genai = None
 
-logging.basicConfig(level=logging.INFO)
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Create the FastAPI app instance
-# Vercel will look for this 'app' object by default.
-app = FastAPI()
+app = FastAPI(title="Simplified Media API")
 
-MODEL_NAME = os.environ.get("WHISPER_MODEL", "base") # Use 'base' by default, configurable via env var
-loaded_model = None
+# --- Whisper Setup ---
+WHISPER_MODEL_NAME = "tiny" # Using the smallest model
+whisper_loaded_model = None
+whisper_loading_lock = asyncio.Lock() # Prevent concurrent loading attempts
 
-def load_whisper_model():
-    """Loads the Whisper model if not already loaded."""
+async def load_whisper_model():
+    """Loads the Whisper model (tiny) if not already loaded."""
     global whisper_loaded_model
-    if not whisper:
-        raise RuntimeError("Whisper library failed to import.")
     if whisper_loaded_model is None:
-        logger.info(f"Loading Whisper model: {WHISPER_MODEL_NAME}...")
-        try:
-            # Consider specifying download_root if needed on Vercel /tmp
-            # whisper_loaded_model = whisper.load_model(WHISPER_MODEL_NAME, download_root="/tmp/whisper_cache")
-            whisper_loaded_model = whisper.load_model(WHISPER_MODEL_NAME)
-            logger.info("Whisper model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Error loading Whisper model '{WHISPER_MODEL_NAME}': {e}", exc_info=True)
-            raise RuntimeError(f"Failed to load Whisper model: {e}")
+        async with whisper_loading_lock:
+            # Double check after acquiring lock
+            if whisper_loaded_model is None:
+                if not whisper:
+                    raise RuntimeError("Whisper library failed to import.")
+                logger.info(f"Loading Whisper model: {WHISPER_MODEL_NAME}...")
+                try:
+                    # Run model loading in executor as it can be CPU/IO bound
+                    loop = asyncio.get_running_loop()
+                    whisper_loaded_model = await loop.run_in_executor(
+                        None, # Default executor
+                        whisper.load_model,
+                        WHISPER_MODEL_NAME
+                    )
+                    logger.info("Whisper model loaded successfully.")
+                except Exception as e:
+                    logger.error(f"Error loading Whisper model '{WHISPER_MODEL_NAME}': {e}", exc_info=True)
+                    raise RuntimeError(f"Failed to load Whisper model: {e}")
     return whisper_loaded_model
 
-# --- Translation Model Loading ---
-# Using a distilled NLLB model for potentially better performance/size balance
-# Other options: "facebook/mbart-large-50-many-to-many-mmt"
-TRANSLATION_MODEL_NAME = os.environ.get("TRANSLATION_MODEL", "facebook/nllb-200-distilled-600M")
-translation_model = None
-translation_tokenizer = None
+# --- Google Gemini Setup ---
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+gemini_model = None
 
-# Simple mapping from common language names/codes to NLLB Flores-200 codes
-# See Flores-200 codes: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
-# Add more mappings as needed
-LANGUAGE_CODE_MAP = {
-    "English": "eng_Latn",
-    "en": "eng_Latn",
-    "Spanish": "spa_Latn",
-    "es": "spa_Latn",
-    "French": "fra_Latn",
-    "fr": "fra_Latn",
-    "German": "deu_Latn",
-    "de": "deu_Latn",
-    "Chinese": "zho_Hans", # Simplified Chinese
-    "zh": "zho_Hans",
-    "Japanese": "jpn_Jpan",
-    "ja": "jpn_Jpan",
-    "Arabic": "arb_Arab",
-    "ar": "arb_Arab",
-    "Russian": "rus_Cyrl",
-    "ru": "rus_Cyrl",
-    "Hindi": "hin_Deva",
-    "hi": "hin_Deva",
-    "Korean": "kor_Hang",
-    "ko": "kor_Hang",
-    "Vietnamese": "vie_Latn",
-    "vi": "vie_Latn",
-    "Indonesian": "ind_Latn",
-    "id": "ind_Latn",
-}
-
-def get_flores_code(lang_name_or_code: str) -> Optional[str]:
-    """Gets the NLLB Flores-200 code for a given language name/code."""
-    return LANGUAGE_CODE_MAP.get(lang_name_or_code.lower())
-
-def load_translation_model_and_tokenizer():
-    """Loads the translation model and tokenizer if not already loaded."""
-    global translation_model, translation_tokenizer
-    if not AutoModelForSeq2SeqLM or not AutoTokenizer:
-         raise RuntimeError("Transformers library failed to import.")
-    if translation_model is None or translation_tokenizer is None:
-        logger.info(f"Loading translation model/tokenizer: {TRANSLATION_MODEL_NAME}...")
-        try:
-            # device_map="auto" might help distribute across resources if available
-            translation_model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL_NAME)
-            translation_tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME)
-            logger.info("Translation model/tokenizer loaded successfully.")
-        except Exception as e:
-            logger.error(f"Error loading translation model '{TRANSLATION_MODEL_NAME}': {e}", exc_info=True)
-            # Reset globals on failure to allow retry later if applicable
-            translation_model = None
-            translation_tokenizer = None
-            raise RuntimeError(f"Failed to load translation model/tokenizer: {e}")
-    return translation_model, translation_tokenizer
-
-
-# --- Helper Functions ---
-async def run_ffmpeg(input_path: str, output_path: str):
-    """
-    Extracts audio from video using the ffmpeg binary copied during build.
-    """
-    # Path to the ffmpeg binary relative to this script (index.py)
-    # Since build.sh copies it to 'api/ffmpeg' and index.py is in 'api/'
-    script_dir = Path(__file__).parent.resolve()
-    ffmpeg_path = script_dir / "ffmpeg" # Should resolve to /var/task/api/ffmpeg at runtime
-
-    # Check if the copied binary exists
-    if not ffmpeg_path.is_file():
-         # If this happens, the copy in build.sh likely failed or the path is wrong
-         logger.error(f"Copied ffmpeg binary not found at expected runtime location: {ffmpeg_path}")
-         # You could also try checking common system paths as a fallback, but rely on the copied one first
-         # ffmpeg_executable_fallback = "ffmpeg" # Try system path
-         raise RuntimeError(f"ffmpeg binary missing at expected location: {ffmpeg_path}. Build copy likely failed.")
-
-    # Make sure it's executable at runtime (belt and suspenders)
+if not GOOGLE_API_KEY:
+    logger.warning("GOOGLE_API_KEY environment variable not set. Translation endpoint will fail.")
+elif not genai:
+    logger.warning("Google Generative AI library not loaded. Translation endpoint will fail.")
+else:
     try:
-        os.chmod(ffmpeg_path, 0o755) # rwxr-xr-x
+        genai.configure(api_key=GOOGLE_API_KEY)
+        # Using gemini-1.5-flash as requested - fast and capable
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        logger.info("Google Gemini client configured successfully with gemini-1.5-flash-latest.")
     except Exception as e:
-        logger.warning(f"Could not set execute permission on {ffmpeg_path}: {e}. It might already be set.")
+        logger.error(f"Failed to configure Google Gemini: {e}", exc_info=True)
+        gemini_model = None # Ensure it's None if setup fails
 
+# --- Helper Function: Audio Extraction ---
+async def extract_audio_moviepy(video_path: str, audio_path: str):
+    """Extracts audio using MoviePy, saving as 16kHz mono WAV."""
+    if not mp:
+        raise RuntimeError("MoviePy library not available.")
 
-    ffmpeg_cmd = [
-        str(ffmpeg_path), # Use the specific path to the copied binary
-        "-i", input_path,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        "-y", output_path,
-    ]
-
-    logger.info(f"Running copied ffmpeg command: {' '.join(ffmpeg_cmd)}")
+    video_clip = None
+    audio_clip = None
     try:
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        logger.info(f"MoviePy: Loading video clip from {video_path}")
+        # Run synchronous moviepy loading in executor
+        loop = asyncio.get_running_loop()
+        video_clip = await loop.run_in_executor(None, mp.VideoFileClip, video_path)
+
+        if video_clip.audio is None:
+             logger.error(f"MoviePy: No audio found in video file {video_path}")
+             raise ValueError("Video file contains no audio stream.")
+
+        audio_clip = video_clip.audio
+        logger.info(f"MoviePy: Writing audio to {audio_path} (16kHz mono WAV)")
+
+        # Run synchronous audio writing in executor
+        await loop.run_in_executor(
+            None,
+            audio_clip.write_audiofile,
+            audio_path,
+            {"codec": 'pcm_s16le', # WAV format
+             "fps": 16000,         # 16kHz sample rate for Whisper
+             "nbytes": 2,          # 16 bits
+             "ffmpeg_params": ["-ac", "1"], # Force mono channel
+             "logger": 'bar'} # Suppress progress bar logging somewhat
         )
-        stdout, stderr = await process.communicate()
+        logger.info("MoviePy: Audio extraction successful.")
 
-        if process.returncode != 0:
-            error_message = stderr.decode().strip()
-            logger.error(f"Copied ffmpeg error (code {process.returncode}): {error_message}")
-            raise RuntimeError(f"Copied ffmpeg failed: {error_message}")
-        else:
-            logger.info("Copied ffmpeg completed successfully.")
-
-    except FileNotFoundError:
-         # This error now specifically means the ffmpeg_path determined above wasn't found/executable
-         logger.error(f"Failed to execute ffmpeg command at path: {ffmpeg_path}")
-         raise RuntimeError(f"ffmpeg execution failed (FileNotFound at {ffmpeg_path}).")
     except Exception as e:
-         logger.error(f"An unexpected error occurred during ffmpeg execution: {e}", exc_info=True)
-         raise RuntimeError(f"Audio extraction failed: {e}")
+        logger.error(f"MoviePy: Error during audio extraction: {e}", exc_info=True)
+        raise RuntimeError(f"MoviePy audio extraction failed: {e}")
+    finally:
+        # Ensure clips are closed to release file handles
+        if audio_clip:
+            try:
+                await loop.run_in_executor(None, audio_clip.close)
+            except Exception as e_close:
+                logger.warning(f"Moviepy: Error closing audio clip: {e_close}")
+        if video_clip:
+            try:
+                await loop.run_in_executor(None, video_clip.close)
+            except Exception as e_close:
+                logger.warning(f"Moviepy: Error closing video clip: {e_close}")
 
-# --- Pydantic Models for Request/Response ---
+
+# --- Pydantic Models ---
 class TranslationRequest(BaseModel):
     text: str
     target_language: str
-    source_language: str = "en" # Default source language is English
 
 # --- API Endpoints ---
 
-@app.get("/api")
+@app.get("/api", tags=["Status"])
 async def api_root():
-    """ Root API endpoint. """
+    """ Root API endpoint providing status. """
     now = datetime.datetime.utcnow().isoformat()
     return JSONResponse(content={
-        "message": "Welcome to the Transcription API!",
+        "message": "Welcome to the Simplified Media API!",
         "status": "ok",
         "timestamp_utc": now,
-        "whisper_model_used": MODEL_NAME
+        "endpoints": ["/api/transcribe", "/api/translate", "/docs"]
     })
 
 @app.post("/api/transcribe", tags=["Transcription"])
-async def transcribe_video(request: Request, file: UploadFile = File(...)):
+async def transcribe_video(file: UploadFile = File(...)):
     """
-    Receives a video file (MP4, AVI, etc.), extracts audio,
-    transcribes it using Whisper, and returns the text.
-    Handles multipart/form-data uploads.
+    Receives video, extracts audio via MoviePy, transcribes via Whisper (tiny).
     """
-    # Basic check if whisper library loaded
     if not whisper:
-         raise HTTPException(status_code=500, detail="Whisper library not available on the server.")
-
-    # Load model (might be cached)
-    try:
-        model = load_whisper_model()
-    except RuntimeError as e:
-         raise HTTPException(status_code=500, detail=f"Failed to load transcription model: {e}")
-
-    # Log request headers for debugging if needed
-    # logger.debug(f"Request Headers: {request.headers}")
+         raise HTTPException(status_code=501, detail="Whisper library not available.")
+    if not mp:
+        raise HTTPException(status_code=501, detail="MoviePy library not available.")
 
     if not file.filename:
          raise HTTPException(status_code=400, detail="No filename provided.")
 
-    # Use a temporary directory for robust cleanup
-    temp_dir = None
-    try:
-        temp_dir = tempfile.mkdtemp(prefix="api_upload_")
-        logger.info(f"Created temporary directory: {temp_dir}")
+    # Use a temporary directory
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="api_upload_")
+    temp_dir = temp_dir_obj.name
+    logger.info(f"Created temporary directory: {temp_dir}")
 
-        video_path = os.path.join(temp_dir, file.filename)
-        # Extract base name and extension for audio file
-        base_name, _ = os.path.splitext(file.filename)
-        audio_filename = f"{base_name}.wav" # Standardize to WAV
+    try:
+        # Define paths within the temp directory
+        # Sanitize filename slightly to avoid path issues, though tempfile is safer
+        safe_filename = Path(file.filename).name
+        video_path = os.path.join(temp_dir, safe_filename)
+        base_name, _ = os.path.splitext(safe_filename)
+        audio_filename = f"{base_name}_extracted_audio.wav"
         audio_path = os.path.join(temp_dir, audio_filename)
 
         # 1. Save uploaded video file temporarily
         logger.info(f"Saving uploaded video to: {video_path}")
         try:
-            # Read the file in chunks to handle large files efficiently
             with open(video_path, "wb") as buffer:
-                while chunk := await file.read(8192): # Read 8KB chunks
+                while chunk := await file.read(8192): # Read in chunks
                     buffer.write(chunk)
             logger.info(f"Successfully saved video file: {video_path}")
-            await file.close() # Close the upload file stream
         except Exception as e:
             logger.error(f"Failed to save uploaded file: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Could not save uploaded file: {e}")
+        finally:
+             # Ensure uploaded file stream is closed
+             await file.close()
 
-        # 2. Extract audio using ffmpeg
-        logger.info(f"Extracting audio to: {audio_path}")
+        # 2. Extract audio using MoviePy
+        logger.info(f"Extracting audio using MoviePy to: {audio_path}")
         try:
-            await run_ffmpeg(video_path, audio_path)
-            logger.info("Audio extraction successful.")
-        except RuntimeError as e:
-            # run_ffmpeg logs details, just raise HTTP exception
+            await extract_audio_moviepy(video_path, audio_path)
+        except (RuntimeError, ValueError) as e:
+            # Catch errors from extract_audio_moviepy
             raise HTTPException(status_code=500, detail=f"Audio extraction failed: {e}")
         except Exception as e:
             logger.error(f"Unexpected error during audio extraction step: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly: {e}")
 
-
         # 3. Transcribe the audio file using Whisper
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-             logger.error(f"Audio file missing or empty after ffmpeg: {audio_path}")
-             raise HTTPException(status_code=500, detail="Audio extraction resulted in an empty or missing file.")
+             logger.error(f"Audio file missing or empty after extraction: {audio_path}")
+             raise HTTPException(status_code=500, detail="Audio extraction resulted in an empty file.")
 
-        logger.info(f"Starting transcription for: {audio_path}")
+        logger.info(f"Loading Whisper model ({WHISPER_MODEL_NAME}) for transcription...")
         try:
-            # Run transcription in executor to avoid blocking event loop if model.transcribe isn't fully async
-            # loop = asyncio.get_running_loop()
-            # result = await loop.run_in_executor(None, model.transcribe, audio_path)
-            # Note: Whisper's transcribe might be CPU-bound. run_in_executor is good practice.
-            # However, for simplicity here, we call it directly. If you face blocking issues, use run_in_executor.
-            result = model.transcribe(audio_path, fp16=False) # fp16=False can improve compatibility/reduce GPU needs
+            model = await load_whisper_model() # Load/get cached model
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load transcription model: {e}")
+
+        logger.info(f"Starting Whisper transcription for: {audio_path}")
+        try:
+            # Run potentially CPU-bound transcription in executor
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                model.transcribe,
+                audio_path,
+                {"fp16": False} # fp16=False safer on CPU
+            )
             transcription = result["text"]
-            logger.info("Transcription successful.")
-            # logger.debug(f"Transcription result: {result}") # Log full result if needed
+            logger.info("Whisper transcription successful.")
         except Exception as e:
             logger.error(f"Whisper transcription failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Transcription process failed: {e}")
@@ -284,7 +237,7 @@ async def transcribe_video(request: Request, file: UploadFile = File(...)):
             "filename": file.filename,
             "content_type": file.content_type,
             "transcription": transcription,
-            "model_used": MODEL_NAME
+            "whisper_model_used": WHISPER_MODEL_NAME
         })
 
     except HTTPException:
@@ -296,111 +249,58 @@ async def transcribe_video(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
 
     finally:
-        # 5. Cleanup temporary files/directory
-        if temp_dir and os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Cleaned up temporary directory: {temp_dir}")
-            except Exception as e:
-                # Log cleanup error but don't prevent response if transcription succeeded
-                logger.error(f"Error cleaning up temporary directory {temp_dir}: {e}", exc_info=True)
-        # Ensure file stream is closed even if saving failed early
-        if not file.file.closed:
-             await file.close()
+        # 5. Cleanup temporary directory using the context manager's exit
+        logger.info(f"Cleaning up temporary directory: {temp_dir}")
+        temp_dir_obj.cleanup() # Explicit cleanup just in case
+
 
 @app.post("/api/translate", tags=["Translation"])
-async def translate_text(payload: TranslationRequest):
+async def translate_text_gemini(payload: TranslationRequest):
     """
-    Translates text from a source language (default: English) to a target language.
-    Requires 'text' and 'target_language' in the JSON request body.
-    'target_language' should be a common name (e.g., 'Spanish', 'French') or code (e.g., 'es', 'fr').
+    Translates text to the target language using Google Gemini API.
     """
-    if not AutoModelForSeq2SeqLM or not AutoTokenizer:
-        raise HTTPException(status_code=501, detail="Translation library not available on the server.")
+    if not gemini_model:
+        raise HTTPException(status_code=501, detail="Gemini API client not configured or library not available.")
+
+    logger.info(f"Received translation request to '{payload.target_language}'")
+
+    # Construct a clear prompt for Gemini
+    prompt = f"Translate the following text into {payload.target_language}. Only return the translated text, without any introductory phrases or explanations:\n\n{payload.text}"
 
     try:
-        model, tokenizer = load_translation_model_and_tokenizer()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load translation model: {e}")
-
-    # --- Get Language Codes ---
-    target_lang_code = get_flores_code(payload.target_language)
-    if not target_lang_code:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported target language: '{payload.target_language}'. Please use a common name or code (e.g., 'Spanish', 'es', 'French', 'fr'). Supported codes: {list(LANGUAGE_CODE_MAP.keys())}"
-        )
-
-    source_lang_code = get_flores_code(payload.source_language)
-    if not source_lang_code:
-         # Defaulting to English if source is not provided or invalid, could raise error instead
-        logger.warning(f"Unsupported source language '{payload.source_language}'. Defaulting to English ('en').")
-        source_lang_code = "eng_Latn" # Default NLLB code for English
-
-    logger.info(f"Translation request: From '{source_lang_code}' To '{target_lang_code}'")
-
-    try:
-        # --- Prepare input for the model ---
-        tokenizer.src_lang = source_lang_code
-        # max_length can be adjusted based on expected input/output sizes
-        inputs = tokenizer(payload.text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-
-        # --- Generate translation ---
-        # Get the target language ID for forcing the decoder
-        forced_bos_token_id = tokenizer.lang_code_to_id[target_lang_code]
-
-        logger.info("Generating translation...")
-        # Use run_in_executor for the potentially CPU-bound generation task
+        logger.info("Sending request to Gemini API...")
+        # Run synchronous SDK call in executor
         loop = asyncio.get_running_loop()
-        generated_tokens = await loop.run_in_executor(
-            None, # Default thread pool executor
-            model.generate, # Function to run
-            **inputs.to(model.device), # Pass tokenized inputs (move to model device if applicable)
-            forced_bos_token_id=forced_bos_token_id, # Force target language
-            max_length=512 # Should match or exceed input max_length
+        response = await loop.run_in_executor(
+            None,
+            gemini_model.generate_content,
+            prompt
         )
-        # generated_tokens = model.generate(
-        #     **inputs.to(model.device), # Ensure tensors are on the same device as model
-        #     forced_bos_token_id=forced_bos_token_id,
-        #     max_length=512 # Adjust as needed
-        # )
 
-        # --- Decode the result ---
-        translated_text = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
-        logger.info("Translation generation successful.")
+        # Check for safety ratings / blocks if necessary (optional)
+        # if response.prompt_feedback.block_reason:
+        #     logger.warning(f"Gemini translation blocked. Reason: {response.prompt_feedback.block_reason}")
+        #     raise HTTPException(status_code=400, detail=f"Translation request blocked by safety filters: {response.prompt_feedback.block_reason}")
+
+        translated_text = response.text # Access the translated text directly
+        logger.info("Gemini translation successful.")
 
         return JSONResponse(content={
             "original_text": payload.text,
-            "source_language_code": source_lang_code,
-            "target_language_code": target_lang_code,
-            "target_language_input": payload.target_language,
+            "target_language": payload.target_language,
             "translated_text": translated_text,
-            "model_used": TRANSLATION_MODEL_NAME
+            "model_used": "gemini-2.0-flash" # Or get from model object if possible/needed
         })
 
     except Exception as e:
-        logger.error(f"Translation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Translation process failed: {e}")
+        # Catch potential API errors, network issues, etc.
+        logger.error(f"Gemini API translation failed: {e}", exc_info=True)
+        # Provide a more specific error if possible based on Gemini SDK exceptions
+        # e.g., if e is google.api_core.exceptions.PermissionDenied: ...
+        raise HTTPException(status_code=503, detail=f"Translation service failed: {e}")
 
 
-
-
-@app.get("/api/hello")
-async def hello_endpoint(name: str = "World"):
-    return JSONResponse(content={"greeting": f"Hello, {name}!"})
-
-# You can add more endpoints here following the same pattern
-# Example POST endpoint (requires sending JSON data in the request body)
-# from pydantic import BaseModel
-# class Item(BaseModel):
-#     id: int
-#     description: str
-
-# @app.post("/api/items")
-# async def create_item(item: Item):
-#    """ Receives item data and returns it """
-#    return JSONResponse(content={"received_item": item.dict()})
-
-# Note: For Vercel, you generally don't run the app with uvicorn directly
-# in this file. Vercel handles the serving part based on the 'app' object.
-# The uvicorn command is used for local development.
+# --- Optional: Add hello endpoint or others back if needed ---
+# @app.get("/api/hello", tags=["Greeting"])
+# async def hello_endpoint(name: str = "World"):
+#     return JSONResponse(content={"greeting": f"Hello, {name}!"})

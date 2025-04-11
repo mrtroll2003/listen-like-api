@@ -1,8 +1,15 @@
-fastapi>=0.90.0,<0.111.0 # Use a recent stable version
-uvicorn[standard]>=0.20.0,<0.26.0 # ASGI server, [standard] includes useful extras
-python-dotenv>=1.0.0,<2.0.0 # Optional: Good for local .env file handling
-openai-whisper>=20231117
-python-multipart>=0.0.5
-transformers>=4.30.0,<5.0.0
-torch>=2.0.0,<3.0.0
-sentencepiece>=0.1.98,<0.2.0
+fastapi>=0.110.0,<0.112.0
+uvicorn[standard]>=0.20.0,<0.30.0 # Includes httptools, websockets, etc.
+python-multipart>=0.0.9,<0.1.0 # For file uploads
+
+# Core Processing Libraries
+moviepy>=1.0.3,<2.0.0           # For audio extraction
+openai-whisper>=20231117,<20240701 # Using specific stable version
+# Note: openai-whisper depends on 'torch'. Vercel's pip should install the CPU version.
+# If torch install fails later, we might need PyTorch index URL, but try without first.
+
+# Google Gemini API
+google-generativeai>=0.5.0,<0.6.0
+
+# Utilities
+python-dotenv>=1.0.0,<2.0.0 
