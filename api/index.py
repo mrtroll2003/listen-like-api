@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 import logging
 import datetime
+from pydantic import BaseModel
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -30,7 +31,6 @@ try:
 except ImportError:
     logging.error("Google Generative AI library not found. pip install google-generativeai")
     genai = None
-    
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
