@@ -25,6 +25,12 @@ except ImportError:
     logging.error("SpeechRecognition library not found. pip install SpeechRecognition")
     sr = None
 
+try:
+    import google.generativeai as genai
+except ImportError:
+    logging.error("Google Generative AI library not found. pip install google-generativeai")
+    genai = None
+    
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -242,50 +248,50 @@ async def transcribe_video(file: UploadFile = File(...)):
         temp_dir_obj.cleanup()
 
 
-# @app.post("/api/translate", tags=["Translation"])
-# async def translate_text_gemini(payload: TranslationRequest):
-#     """
-#     Translates text to the target language using Google Gemini API.
-#     """
-#     if not gemini_model:
-#         raise HTTPException(status_code=501, detail="Gemini API client not configured or library not available.")
+@app.post("/api/translate", tags=["Translation"])
+async def translate_text_gemini(payload: TranslationRequest):
+    """
+    Translates text to the target language using Google Gemini API.
+    """
+    if not gemini_model:
+        raise HTTPException(status_code=501, detail="Gemini API client not configured or library not available.")
 
-#     logger.info(f"Received translation request to '{payload.target_language}'")
+    logger.info(f"Received translation request to '{payload.target_language}'")
 
-#     # Construct a clear prompt for Gemini
-#     prompt = f"Translate the following text into {payload.target_language}. Only return the translated text, without any introductory phrases or explanations:\n\n{payload.text}"
+    # Construct a clear prompt for Gemini
+    prompt = f"Translate the following text into {payload.target_language}. Only return the translated text, without any introductory phrases or explanations:\n\n{payload.text}"
 
-#     try:
-#         logger.info("Sending request to Gemini API...")
-#         # Run synchronous SDK call in executor
-#         loop = asyncio.get_running_loop()
-#         response = await loop.run_in_executor(
-#             None,
-#             gemini_model.generate_content,
-#             prompt
-#         )
+    try:
+        logger.info("Sending request to Gemini API...")
+        # Run synchronous SDK call in executor
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            gemini_model.generate_content,
+            prompt
+        )
 
-#         # Check for safety ratings / blocks if necessary (optional)
-#         # if response.prompt_feedback.block_reason:
-#         #     logger.warning(f"Gemini translation blocked. Reason: {response.prompt_feedback.block_reason}")
-#         #     raise HTTPException(status_code=400, detail=f"Translation request blocked by safety filters: {response.prompt_feedback.block_reason}")
+        # Check for safety ratings / blocks if necessary (optional)
+        # if response.prompt_feedback.block_reason:
+        #     logger.warning(f"Gemini translation blocked. Reason: {response.prompt_feedback.block_reason}")
+        #     raise HTTPException(status_code=400, detail=f"Translation request blocked by safety filters: {response.prompt_feedback.block_reason}")
 
-#         translated_text = response.text # Access the translated text directly
-#         logger.info("Gemini translation successful.")
+        translated_text = response.text # Access the translated text directly
+        logger.info("Gemini translation successful.")
 
-#         return JSONResponse(content={
-#             "original_text": payload.text,
-#             "target_language": payload.target_language,
-#             "translated_text": translated_text,
-#             "model_used": "gemini-2.0-flash" # Or get from model object if possible/needed
-#         })
+        return JSONResponse(content={
+            "original_text": payload.text,
+            "target_language": payload.target_language,
+            "translated_text": translated_text,
+            "model_used": "gemini-2.0-flash" # Or get from model object if possible/needed
+        })
 
-#     except Exception as e:
-#         # Catch potential API errors, network issues, etc.
-#         logger.error(f"Gemini API translation failed: {e}", exc_info=True)
-#         # Provide a more specific error if possible based on Gemini SDK exceptions
-#         # e.g., if e is google.api_core.exceptions.PermissionDenied: ...
-#         raise HTTPException(status_code=503, detail=f"Translation service failed: {e}")
+    except Exception as e:
+        # Catch potential API errors, network issues, etc.
+        logger.error(f"Gemini API translation failed: {e}", exc_info=True)
+        # Provide a more specific error if possible based on Gemini SDK exceptions
+        # e.g., if e is google.api_core.exceptions.PermissionDenied: ...
+        raise HTTPException(status_code=503, detail=f"Translation service failed: {e}")
 
 
 # --- Optional: Add hello endpoint or others back if needed ---
