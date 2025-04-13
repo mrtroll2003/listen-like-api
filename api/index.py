@@ -6,7 +6,9 @@ import asyncio
 from pathlib import Path
 import logging
 import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl, ValidationError
+import re # Added for regex
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -31,6 +33,16 @@ try:
 except ImportError:
     logging.error("Google Generative AI library not found. pip install google-generativeai")
     genai = None
+
+try:
+    from pytube import YouTube
+    from pytube.exceptions import PytubeError, VideoUnavailable, RegexMatchError
+except ImportError:
+     logging.error("Pytube library not found. pip install pytube")
+     YouTube = None
+     PytubeError = None # Define base exception for broader catch if needed
+     VideoUnavailable = None
+     RegexMatchError = None
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -49,9 +61,8 @@ elif not genai:
 else:
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        # Using gemini-1.5-flash as requested - fast and capable
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        logger.info("Google Gemini client configured successfully with gemini-1.5-flash-latest.")
+        gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+        logger.info("Google Gemini client configured successfully with gemini-2.0-flash.")
     except Exception as e:
         logger.error(f"Failed to configure Google Gemini: {e}", exc_info=True)
         gemini_model = None # Ensure it's None if setup fails
@@ -81,8 +92,11 @@ async def extract_audio_moviepy(video_path: str, audio_path: str):
             None,
             audio_clip.write_audiofile,
             audio_path,
-            {"codec": 'pcm_s16le', # Standard WAV codec
-             "logger": None}       # Quieter logging
+            fps=16000,           # Keyword arg: sample rate
+            nbytes=2,            # Keyword arg: 16-bit audio
+            codec='pcm_s16le',   # Keyword arg: WAV codec
+            ffmpeg_params=["-ac", "1"], # Keyword arg: Force mono channel using ffmpeg param
+            logger=None
         )
         logger.info("MoviePy: Audio extraction successful.")
 
@@ -145,11 +159,57 @@ def _sync_transcribe(recognizer: sr.Recognizer, audio_path: str) -> str:
         transcript = recognizer.recognize_google(audio_data)
         logger.info(f"SpeechRecognition: Transcription received.")
     return transcript
+# Link syntax checker/for regex
+YOUTUBE_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+}
+
+def is_valid_youtube_url(url: str) -> bool:
+    """Checks if a string is a valid HTTP/HTTPS URL pointing to a known YouTube domain."""
+    try:
+        # Basic URL structure validation
+        parsed_url = urlparse(url)
+        if not all([parsed_url.scheme in ["http", "https"], parsed_url.netloc]):
+            logger.warning(f"URL validation failed (scheme/netloc): {url}")
+            return False
+
+        # Check if the domain is a known YouTube domain
+        domain = parsed_url.netloc.lower()
+        if domain not in YOUTUBE_DOMAINS:
+            # Handle youtu.be separately as netloc is just 'youtu.be'
+             if domain == 'youtu.be' and parsed_url.path and len(parsed_url.path) > 1:
+                 return True # youtu.be/VIDEO_ID is valid
+             logger.warning(f"URL validation failed (domain not YouTube): {domain}")
+             return False
+
+        # For youtube.com domains, check for /watch path (basic check)
+        if "youtube.com" in domain:
+            if not parsed_url.path.startswith("/watch"):
+                 logger.warning(f"URL validation failed (path not /watch): {parsed_url.path}")
+                 # Allow other valid paths like /shorts/ ? Maybe too complex for basic validation.
+                 # return False # Be strict? Or allow other paths? Let's be lenient for now.
+                 pass # Allow other paths for now
+
+        # Optional: More sophisticated regex for video ID might be added later
+        # For now, domain and basic structure check is sufficient
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Error during URL parsing: {e}", exc_info=True)
+        return False
 
 # --- Pydantic Models ---
 class TranslationRequest(BaseModel):
     text: str
     target_language: str
+
+class YouTubeTranscribeRequest(BaseModel):
+    youtube_url: str
+    # Future: add language hint, model choice etc.
 
 # --- API Endpoints ---
 
@@ -161,7 +221,7 @@ async def api_root():
         "message": "Welcome to the Simplified Media API!",
         "status": "ok",
         "timestamp_utc": now,
-        "endpoints": ["/api/transcribe", "/api/translate", "/docs"]
+        "endpoints": ["/api/transcribe", "/api/translate", "/api/transcribe_youtube", "/docs"]
     })
 
 @app.post("/api/transcribe", tags=["Transcription"])
@@ -245,6 +305,123 @@ async def transcribe_video(file: UploadFile = File(...)):
     finally:
         # Cleanup temporary directory
         logger.info(f"Cleaning up temporary directory: {temp_dir}")
+        temp_dir_obj.cleanup()
+
+@app.post("/api/transcribe_youtube", tags=["Transcription"])
+async def transcribe_youtube(payload: YouTubeTranscribeRequest):
+    """
+    Downloads audio from a YouTube URL, extracts audio, and transcribes it.
+    """
+    if not YouTube:
+        raise HTTPException(status_code=501, detail="Pytube library not available.")
+    if not sr:
+         raise HTTPException(status_code=501, detail="SpeechRecognition library not available.")
+    if not mp:
+        raise HTTPException(status_code=501, detail="MoviePy library not available.")
+
+    # 1. Validate URL
+    if not is_valid_youtube_url(payload.youtube_url):
+        raise HTTPException(status_code=400, detail="Invalid or non-YouTube URL provided.")
+
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="youtube_dl_")
+    temp_dir = temp_dir_obj.name
+    logger.info(f"Created temporary directory for YouTube download: {temp_dir}")
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        # 2. Download Audio using Pytube
+        logger.info(f"Attempting to download audio for YouTube URL: {payload.youtube_url}")
+        downloaded_file_path = None
+        try:
+            # Run synchronous pytube operations in executor
+            def _sync_download():
+                yt = YouTube(payload.youtube_url)
+                # Filter for audio-only streams, prefer mp4 (often AAC), order by bitrate desc
+                audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
+                if not audio_stream:
+                    # Fallback: Try any audio stream if mp4 isn't available
+                    logger.warning("No MP4 audio stream found, trying any audio stream...")
+                    audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+
+                if not audio_stream:
+                    logger.error("No suitable audio stream found for this YouTube video.")
+                    raise ValueError("No suitable audio-only stream found.")
+
+                logger.info(f"Selected audio stream: itag={audio_stream.itag}, abr={audio_stream.abr}, type={audio_stream.mime_type}")
+                # Define a consistent filename for the download
+                download_filename = "youtube_audio_download" # Extension will be added by pytube
+                return audio_stream.download(output_path=temp_dir, filename=download_filename)
+
+            # Execute the download function
+            downloaded_file_path = await loop.run_in_executor(None, _sync_download)
+            logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
+
+        except (VideoUnavailable, RegexMatchError) as e:
+            logger.error(f"Pytube error: Video unavailable or URL regex failed for {payload.youtube_url}: {e}", exc_info=True)
+            raise HTTPException(status_code=404, detail=f"Video not found or unavailable: {e}")
+        except PytubeError as e: # Catch other general pytube errors
+             logger.error(f"Pytube error downloading {payload.youtube_url}: {e}", exc_info=True)
+             raise HTTPException(status_code=500, detail=f"Failed to download YouTube audio: {e}")
+        except ValueError as e: # Catch our specific "no stream" error
+             logger.error(f"ValueError during YouTube download: {e}")
+             raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e: # Catch unexpected errors during download
+             logger.error(f"Unexpected error during YouTube download: {e}", exc_info=True)
+             raise HTTPException(status_code=500, detail="An unexpected error occurred during download.")
+
+
+        # 3. Extract/Convert Audio to WAV using MoviePy (for consistency)
+        if not downloaded_file_path or not os.path.exists(downloaded_file_path):
+             logger.error("Downloaded audio file path is missing after pytube download.")
+             raise HTTPException(status_code=500, detail="Audio download succeeded but file is missing.")
+
+        base_name, _ = os.path.splitext(os.path.basename(downloaded_file_path))
+        wav_audio_filename = f"{base_name}_extracted.wav"
+        wav_audio_path = os.path.join(temp_dir, wav_audio_filename)
+
+        logger.info(f"Extracting/Converting downloaded audio to WAV: {wav_audio_path}")
+        try:
+            # Use the existing moviepy function
+            await extract_audio_moviepy(downloaded_file_path, wav_audio_path)
+        except (RuntimeError, ValueError) as e:
+            logger.error(f"Audio extraction failed for downloaded YouTube audio: {e}")
+            raise HTTPException(status_code=500, detail=str(e)) # Pass detailed error
+        except Exception as e:
+            logger.error(f"Unexpected error during audio extraction: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly.")
+
+        # 4. Transcribe the extracted WAV file
+        if not os.path.exists(wav_audio_path):
+             logger.error(f"WAV audio file missing after extraction: {wav_audio_path}")
+             raise HTTPException(status_code=500, detail="Audio conversion did not produce a WAV file.")
+
+        logger.info(f"Starting transcription for YouTube audio: {wav_audio_path}")
+        transcription = await transcribe_audio_google(wav_audio_path)
+
+        # Check for transcription errors
+        if transcription.startswith("Error:"):
+            logger.warning(f"Transcription failed for YouTube audio with message: {transcription}")
+            status_code = 502 if "service" in transcription else 400 if "Could not transcribe" in transcription else 500
+            raise HTTPException(status_code=status_code, detail=transcription)
+
+        logger.info("YouTube Transcription successful.")
+
+        # 5. Return the result
+        return JSONResponse(content={
+            "youtube_url": payload.youtube_url,
+            "transcription": transcription,
+            "engine": "SpeechRecognition (Google Web Speech API)"
+        })
+
+    except HTTPException:
+        raise # Re-raise exceptions we already handled
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in transcribe_youtube endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal server error occurred processing YouTube URL.")
+    finally:
+        # Cleanup temporary directory
+        logger.info(f"Cleaning up YouTube temporary directory: {temp_dir}")
         temp_dir_obj.cleanup()
 
 
