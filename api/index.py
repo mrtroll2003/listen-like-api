@@ -26,9 +26,11 @@ except ImportError:
 
 try:
     import google.generativeai as genai
+    from google.api_core import exceptions as google_api_exceptions
 except ImportError:
     logging.error("Google Generative AI library not found. pip install google-generativeai")
     genai = None
+    google_api_exceptions = None
 
 try:
     from pytube import YouTube
@@ -162,11 +164,14 @@ async def transcribe_audio_gemini(audio_path: str) -> str:
         logger.info(f"Gemini: Uploading audio file: {audio_path} (MIME: {mime_type})")
         # Run synchronous SDK call in executor
         loop = asyncio.get_running_loop()
+        upload_func_partial = functools.partial(
+            genai.upload_file,
+            path=audio_path,      # Pass args intended for upload_file here
+            mime_type=mime_type
+        )
         uploaded_file = await loop.run_in_executor(
             None,
-            genai.upload_file,
-            path=audio_path,
-            mime_type=mime_type
+            upload_func_partial
         )
         logger.info(f"Gemini: File uploaded successfully. URI: {uploaded_file.uri}")
 
@@ -174,11 +179,15 @@ async def transcribe_audio_gemini(audio_path: str) -> str:
         prompt = "Please transcribe the following audio file."
         logger.info("Gemini: Sending transcription request...")
 
+        generate_func_partial = functools.partial(
+            gemini_model.generate_content,
+            [prompt, uploaded_file] # Arguments for generate_content
+            # Add other generate_content args here if needed (e.g., generation_config)
+        )
         # Make the generate_content call in executor
         response = await loop.run_in_executor(
             None,
-            gemini_model.generate_content,
-            [prompt, uploaded_file] # Pass prompt and file object
+            generate_func_partial   # Call the pre-configured function
         )
 
         # Check for potential blocks or empty responses
