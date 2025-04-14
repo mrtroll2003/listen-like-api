@@ -24,14 +24,6 @@ except ImportError:
     mp = None
 
 try:
-    import speech_recognition as sr
-    # Check for internet connection needed for recognize_google()
-    # Can't reliably check this at import time in serverless, handle errors later
-except ImportError:
-    logging.error("SpeechRecognition library not found. pip install SpeechRecognition")
-    sr = None
-
-try:
     import google.generativeai as genai
 except ImportError:
     logging.error("Google Generative AI library not found. pip install google-generativeai")
@@ -143,51 +135,86 @@ async def extract_audio_moviepy(video_path: str, audio_path: str):
             except Exception as e_close: logger.warning(f"Moviepy: Error closing video clip: {e_close}")
 
 
-# --- Helper Function: Transcription (SpeechRecognition) ---
-async def transcribe_audio_google(audio_path: str) -> str:
+# --- Helper Function: Transcription  ---
+async def transcribe_audio_gemini(audio_path: str) -> str:
     """
-    Transcribes audio from a file using SpeechRecognition's Google Web Speech API.
-    Runs the synchronous SpeechRecognition code in an executor.
+    Transcribes audio from a file using the Google Gemini API.
+    Uploads the file and sends it with a transcription prompt.
     """
-    if not sr:
-        raise RuntimeError("SpeechRecognition library not available.")
+    if not genai or not gemini_model:
+        raise RuntimeError("Gemini API client not configured or library not available.")
 
-    recognizer = sr.Recognizer()
-    # Note: Add timeout/phrase_time_limit if needed, but Recognizer handles file reading
-    # recognizer.pause_threshold = 0.8 # Example adjustment
-
-    loop = asyncio.get_running_loop()
+    uploaded_file = None
     try:
-        transcript = await loop.run_in_executor(
-            None, # Default thread pool executor
-            _sync_transcribe, # Helper sync function
-            recognizer,
-            audio_path
-        )
-        return transcript
-    except sr.UnknownValueError:
-        logger.warning(f"Google Web Speech could not understand audio: {audio_path}")
-        return "Error: Could not transcribe audio (Speech not recognized)"
-    except sr.RequestError as e:
-        logger.error(f"Google Web Speech API request failed: {e}")
-        # Don't expose detailed error potentially containing keys/internal info
-        return f"Error: Could not request results from transcription service."
-    except Exception as e:
-        logger.error(f"Unexpected error during transcription: {e}", exc_info=True)
-        return "Error: An unexpected error occurred during transcription."
+        # 1. Determine MIME type
+        mime_type, _ = mimetypes.guess_type(audio_path)
+        if not mime_type or not mime_type.startswith("audio/"):
+            # Default or fallback if guess fails for common types
+            if audio_path.lower().endswith(".wav"): mime_type = "audio/wav"
+            elif audio_path.lower().endswith(".mp3"): mime_type = "audio/mpeg"
+            elif audio_path.lower().endswith(".ogg"): mime_type = "audio/ogg"
+            # Add more if needed, or raise error
+            else: mime_type = "application/octet-stream" # Generic fallback
+            logger.warning(f"Could not guess MIME type for {audio_path}, using {mime_type}")
 
-def _sync_transcribe(recognizer: sr.Recognizer, audio_path: str) -> str:
-    """Synchronous helper for transcription to run in executor."""
-    audio_file = sr.AudioFile(audio_path)
-    with audio_file as source:
-        logger.info(f"SpeechRecognition: Recording audio data from {audio_path}")
-        # record() loads the whole file here, might be memory intensive for long files
-        audio_data = recognizer.record(source)
-        logger.info(f"SpeechRecognition: Sending audio data for recognition...")
-        # This is the part that makes the network call to Google
-        transcript = recognizer.recognize_google(audio_data)
-        logger.info(f"SpeechRecognition: Transcription received.")
-    return transcript
+        # 2. Upload the audio file
+        logger.info(f"Gemini: Uploading audio file: {audio_path} (MIME: {mime_type})")
+        # Run synchronous SDK call in executor
+        loop = asyncio.get_running_loop()
+        uploaded_file = await loop.run_in_executor(
+            None,
+            genai.upload_file,
+            path=audio_path,
+            mime_type=mime_type
+        )
+        logger.info(f"Gemini: File uploaded successfully. URI: {uploaded_file.uri}")
+
+        # 3. Generate content with prompt and uploaded file
+        prompt = "Please transcribe the following audio file."
+        logger.info("Gemini: Sending transcription request...")
+
+        # Make the generate_content call in executor
+        response = await loop.run_in_executor(
+            None,
+            gemini_model.generate_content,
+            [prompt, uploaded_file] # Pass prompt and file object
+        )
+
+        # Check for potential blocks or empty responses
+        if not response.candidates:
+             logger.warning("Gemini: Response has no candidates. Possibly blocked or empty.")
+             # Try accessing prompt feedback for block reason
+             block_reason = getattr(response.prompt_feedback, 'block_reason', None)
+             if block_reason:
+                 return f"Error: Transcription request blocked by safety filters: {block_reason}"
+             else:
+                 return "Error: Transcription failed (No response candidates)"
+
+        # Extract text from the first candidate
+        # Assuming the transcription is in response.text or parts
+        transcription = response.text
+        logger.info("Gemini: Transcription received successfully.")
+        return transcription
+
+    except google_api_exceptions.PermissionDenied as e:
+         logger.error(f"Gemini API Permission Denied: {e}", exc_info=True)
+         return "Error: Gemini API permission denied. Check your API key and permissions."
+    except google_api_exceptions.ResourceExhausted as e:
+         logger.error(f"Gemini API Quota Exceeded: {e}", exc_info=True)
+         return "Error: Gemini API quota limit reached. Please try again later."
+    except Exception as e:
+        logger.error(f"Gemini transcription failed: {e}", exc_info=True)
+        # Provide a general error, specific details logged
+        return f"Error: An unexpected error occurred during Gemini transcription ({type(e).__name__})."
+    finally:
+        # Optional: Delete the uploaded file from Gemini storage if desired
+        # This might require tracking the uploaded_file.name and calling genai.delete_file()
+        # For simplicity, we omit this now, but be aware files might persist temporarily.
+        if uploaded_file:
+            logger.debug(f"Gemini: Uploaded file object: name={uploaded_file.name}, uri={uploaded_file.uri}")
+            # Consider adding deletion logic here if managing storage is critical
+
+
 # Link syntax checker/for regex
 YOUTUBE_DOMAINS = {
     "youtube.com",
@@ -215,16 +242,7 @@ def is_valid_youtube_url(url: str) -> bool:
              return False
 
         # For youtube.com domains, check for /watch path (basic check)
-        if "youtube.com" in domain:
-            if not parsed_url.path.startswith("/watch"):
-                 logger.warning(f"URL validation failed (path not /watch): {parsed_url.path}")
-                 # Allow other valid paths like /shorts/ ? Maybe too complex for basic validation.
-                 # return False # Be strict? Or allow other paths? Let's be lenient for now.
-                 pass # Allow other paths for now
-
-        # Optional: More sophisticated regex for video ID might be added later
-        # For now, domain and basic structure check is sufficient
-
+        if "youtube.com" in domain: pass
         return True
 
     except Exception as e:
@@ -256,10 +274,9 @@ async def api_root():
 @app.post("/api/transcribe", tags=["Transcription"])
 async def transcribe_video(file: UploadFile = File(...)):
     """
-    Receives video, extracts audio via MoviePy, transcribes via SpeechRecognition (Google Web Speech API).
+    Receives video, extracts audio via MoviePy, transcribes via Gemini.
     """
-    if not sr:
-         raise HTTPException(status_code=501, detail="SpeechRecognition library not available.")
+    if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
     if not mp:
         raise HTTPException(status_code=501, detail="MoviePy library not available.")
 
@@ -307,13 +324,14 @@ async def transcribe_video(file: UploadFile = File(...)):
              raise HTTPException(status_code=500, detail="Audio extraction did not produce a file.")
 
         logger.info(f"Starting transcription for: {audio_path}")
-        transcription = await transcribe_audio_google(audio_path)
+        transcription = await transcribe_audio_gemini(audio_path)
 
         # Check if transcription returned an error message
         if transcription.startswith("Error:"):
             logger.warning(f"Transcription failed with message: {transcription}")
             # Return 502 Bad Gateway if the external service failed, 400 if audio was bad
-            status_code = 502 if "service" in transcription else 400 if "Could not transcribe" in transcription else 500
+            status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
+                          400 if "blocked" in transcription.lower() else 500 # Default internal error
             raise HTTPException(status_code=status_code, detail=transcription)
 
         logger.info("Transcription successful.")
@@ -323,7 +341,7 @@ async def transcribe_video(file: UploadFile = File(...)):
             "filename": file.filename,
             "content_type": file.content_type,
             "transcription": transcription,
-            "engine": "SpeechRecognition (Google Web Speech API)"
+            "engine": "Google Gemini"
         })
 
     except HTTPException:
@@ -343,8 +361,7 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
     """
     if not YouTube:
         raise HTTPException(status_code=501, detail="Pytube library not available.")
-    if not sr:
-         raise HTTPException(status_code=501, detail="SpeechRecognition library not available.")
+    if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
     if not mp:
         raise HTTPException(status_code=501, detail="MoviePy library not available.")
 
@@ -426,12 +443,13 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
              raise HTTPException(status_code=500, detail="Audio conversion did not produce a WAV file.")
 
         logger.info(f"Starting transcription for YouTube audio: {wav_audio_path}")
-        transcription = await transcribe_audio_google(wav_audio_path)
+        transcription = await transcribe_audio_gemini(wav_audio_path)
 
         # Check for transcription errors
         if transcription.startswith("Error:"):
             logger.warning(f"Transcription failed for YouTube audio with message: {transcription}")
-            status_code = 502 if "service" in transcription else 400 if "Could not transcribe" in transcription else 500
+            status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
+                          400 if "blocked" in transcription.lower() else 500
             raise HTTPException(status_code=status_code, detail=transcription)
 
         logger.info("YouTube Transcription successful.")
