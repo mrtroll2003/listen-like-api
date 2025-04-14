@@ -10,6 +10,8 @@ import datetime
 from pydantic import BaseModel, HttpUrl, ValidationError
 import re # Added for regex
 from urllib.parse import urlparse
+import wave
+import contextlib 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -105,7 +107,28 @@ async def extract_audio_moviepy(video_path: str, audio_path: str):
             write_func_partial  # Call the pre-configured function
         )
         logger.info("MoviePy: Audio extraction successful.")
-
+        #debug log
+        if os.path.exists(audio_path):
+            try:
+                with contextlib.closing(wave.open(audio_path, 'rb')) as wf:
+                    channels = wf.getnchannels()
+                    framerate = wf.getframerate()
+                    sampwidth = wf.getsampwidth()
+                    nframes = wf.getnframes()
+                    duration = nframes / float(framerate) if framerate > 0 else 0
+                    logger.info(f"WAV Check: Path={audio_path}, Channels={channels}, Rate={framerate}, Width={sampwidth} bytes, Duration={duration:.2f}s")
+                # Check if properties match expectations
+                if channels != 1: logger.warning("WAV Check: Audio is not mono!")
+                if framerate != 16000: logger.warning(f"WAV Check: Sample rate is {framerate}, expected 16000!")
+                if sampwidth != 2: logger.warning(f"WAV Check: Sample width is {sampwidth} bytes, expected 2 (16-bit)!")
+            except wave.Error as wave_err:
+                logger.error(f"WAV Check: Error reading WAV file properties: {wave_err}")
+            except Exception as e:
+                logger.error(f"WAV Check: Unexpected error checking WAV properties: {e}", exc_info=True)
+        else:
+            logger.error(f"WAV Check: Audio file missing, cannot check properties: {audio_path}")
+            raise HTTPException(status_code=500, detail="Audio extraction did not produce a file.")
+        #debug log ends
     except Exception as e:
         logger.error(f"MoviePy: Error during audio extraction: {e}", exc_info=True)
         # Reraise with a general message, specific error logged
