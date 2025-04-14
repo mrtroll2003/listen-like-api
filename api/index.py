@@ -3,6 +3,7 @@ import sys
 import tempfile
 import shutil
 import functools
+import mimetypes
 import asyncio
 from pathlib import Path
 import logging

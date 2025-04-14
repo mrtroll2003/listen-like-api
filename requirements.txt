@@ -12,5 +12,3 @@ pytube>=15.0.0,<16.0.0 # For YouTube links
 
 # Utilities
 python-dotenv>=1.0.0,<2.0.0
-functools # Standard library, but good to remember we use it
-mimetypes # Standard library, needed for upload
