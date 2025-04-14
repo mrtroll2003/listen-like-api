@@ -11,8 +11,13 @@ import datetime
 from pydantic import BaseModel, HttpUrl, ValidationError
 import re # Added for regex
 from urllib.parse import urlparse
-import wave
-import contextlib 
+
+import time #for yt transcribe timeout
+import urllib.error #for yt transcribe errcatch
+
+
+import wave     #For logging/
+import contextlib #debugging
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -392,27 +397,63 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
         try:
             # Run synchronous pytube operations in executor
             def _sync_download():
-                yt = YouTube(payload.youtube_url)
-                # Filter for audio-only streams, prefer mp4 (often AAC), order by bitrate desc
-                audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
-                if not audio_stream:
-                    # Fallback: Try any audio stream if mp4 isn't available
-                    logger.warning("No MP4 audio stream found, trying any audio stream...")
-                    audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                MAX_RETRIES = 3
+                INITIAL_WAIT_SECONDS = 1.5 # Start with 1.5 seconds
 
-                if not audio_stream:
-                    logger.error("No suitable audio stream found for this YouTube video.")
-                    raise ValueError("No suitable audio-only stream found.")
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        logger.info(f"YouTube Download Attempt {attempt + 1}/{MAX_RETRIES}")
+                        yt = YouTube(payload.youtube_url) # Use the payload from the outer scope
 
-                logger.info(f"Selected audio stream: itag={audio_stream.itag}, abr={audio_stream.abr}, type={audio_stream.mime_type}")
-                # Define a consistent filename for the download
-                download_filename = "youtube_audio_download" # Extension will be added by pytube
-                return audio_stream.download(output_path=temp_dir, filename=download_filename)
+                        # --- Get stream info ---
+                        # This is often the part that gets rate-limited first
+                        audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
+                        if not audio_stream:
+                            logger.warning("No MP4 audio stream found, trying any audio stream...")
+                            audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                        if not audio_stream:
+                            logger.error("No suitable audio stream found for this YouTube video.")
+                            raise ValueError("No suitable audio-only stream found.")
+                            # --- End get stream info ---
+
+                        logger.info(f"Selected audio stream: itag={audio_stream.itag}, abr={audio_stream.abr}, type={audio_stream.mime_type}")
+                        download_filename = "youtube_audio_download"
+                        # --- Perform download ---
+                        downloaded_path = audio_stream.download(output_path=temp_dir, filename=download_filename) # Use temp_dir from outer scope
+                        logger.info(f"Download successful on attempt {attempt + 1}")
+                        return downloaded_path # Success! Exit the loop and function.
+                        # --- End perform download ---
+
+                    except urllib.error.HTTPError as e:
+                        if e.code == 429: # Specifically catch "Too Many Requests"
+                            wait_time = INITIAL_WAIT_SECONDS * (2 ** attempt) # Exponential backoff (1.5s, 3s, 6s)
+                            logger.warning(f"HTTP 429 Too Many Requests. Retrying in {wait_time:.1f} seconds...")
+                            if attempt < MAX_RETRIES - 1: # Don't sleep after the last attempt
+                                time.sleep(wait_time)
+                            continue # Go to the next attempt in the loop
+                        else:
+                # Re-raise other HTTPErrors immediately
+                            logger.error(f"HTTP Error during YouTube download (Code {e.code}): {e}")
+                            raise # Re-raise the original error
+                    except Exception as e:
+             # Catch other potential errors during this attempt
+                        logger.error(f"Error during YouTube download attempt {attempt + 1}: {e}", exc_info=True)
+             # Depending on the error, you might want to break or continue
+             # For now, let's break on any other error during an attempt
+                        raise # Re-raise the error to be caught by the outer handler
+
+        # If the loop finishes without returning (i.e., all retries failed)
+                logger.error(f"YouTube download failed after {MAX_RETRIES} attempts due to rate limiting or other errors.")
+        # Raise a specific error indicating retry failure
+                raise RuntimeError(f"Failed to download YouTube audio after {MAX_RETRIES} attempts (Likely rate-limited).")
 
             # Execute the download function
             downloaded_file_path = await loop.run_in_executor(None, _sync_download)
             logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
 
+        except RuntimeError as e: # Catch the specific retry failure error
+            logger.error(f"RuntimeError from YouTube download: {e}")
+            raise HTTPException(status_code=503, detail=str(e)) # Service Unavailable
         except (VideoUnavailable, RegexMatchError) as e:
             logger.error(f"Pytube error: Video unavailable or URL regex failed for {payload.youtube_url}: {e}", exc_info=True)
             raise HTTPException(status_code=404, detail=f"Video not found or unavailable: {e}")
