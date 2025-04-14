@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import shutil
+import functools
 import asyncio
 from pathlib import Path
 import logging
@@ -87,16 +88,21 @@ async def extract_audio_moviepy(video_path: str, audio_path: str):
         audio_clip = video_clip.audio
         logger.info(f"MoviePy: Writing audio to {audio_path} (WAV)")
 
+        # Create a partial function with all arguments pre-filled
+        write_func_partial = functools.partial(
+            audio_clip.write_audiofile,
+            audio_path,             # 1st positional arg for write_audiofile
+            fps=16000,              # Keyword args for write_audiofile
+            nbytes=2,
+            codec='pcm_s16le',
+            ffmpeg_params=["-ac", "1"],
+            logger=None
+        )
+
         # Write as standard WAV, SpeechRecognition will handle format internally
         await loop.run_in_executor(
-            None,
-            audio_clip.write_audiofile,
-            audio_path,
-            fps=16000,           # Keyword arg: sample rate
-            nbytes=2,            # Keyword arg: 16-bit audio
-            codec='pcm_s16le',   # Keyword arg: WAV codec
-            ffmpeg_params=["-ac", "1"], # Keyword arg: Force mono channel using ffmpeg param
-            logger=None
+            None,               # Use default executor
+            write_func_partial  # Call the pre-configured function
         )
         logger.info("MoviePy: Audio extraction successful.")
 
