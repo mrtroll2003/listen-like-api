@@ -7,10 +7,7 @@ moviepy>=1.0.3,<2.0.0           # For audio extraction
 
 # Google Gemini API
 google-generativeai>=0.5.0,<0.6.0
-# YouTube Downloader
-pafy>=0.5.5,<0.6.0
-yt-dlp>=2023.10.13,<=2025.3.31
-youtube-dl>=2021.12.17,<2022.0.0
+
 
 # Utilities
 python-dotenv>=1.0.0,<2.0.0

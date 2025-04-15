@@ -8,13 +8,14 @@ import asyncio
 from pathlib import Path
 import logging
 import datetime
-import pafy
-from pydantic import BaseModel, HttpUrl, ValidationError
+from pydantic import BaseModel, HttpUrl, ValidationError, Field
+from typing import Optional, List # Added List
 import re # Added for regex
 from urllib.parse import urlparse
 
 import time #for yt transcribe timeout
 import urllib.error #for yt transcribe errcatch
+import json # Added for JSON parsing
 
 
 import wave     #For logging/
@@ -40,16 +41,6 @@ except ImportError:
     logging.error("Google Generative AI library not found. pip install google-generativeai")
     genai = None
     google_api_exceptions = None
-
-
-    # Check if backend yt-dlp is available (optional but good practice)
-try:
-    import yt_dlp
-    logger.info("yt-dlp backend found for pafy.")
-except ImportError:
-    logger.warning("yt-dlp backend not found. Pafy might use bundled youtube-dl or fail.")
-
-
 
 app = FastAPI(title="Simplified Media API")
 
@@ -317,9 +308,15 @@ class TranslationRequest(BaseModel):
     text: str
     target_language: str
 
-class YouTubeTranscribeRequest(BaseModel):
-    youtube_url: str
-    # Future: add language hint, model choice etc.
+# class YouTubeTranscribeRequest(BaseModel):
+#     youtube_url: str
+#     # Future: add language hint, model choice etc.
+class QuestionGenerationRequest(BaseModel):
+    transcript: str = Field(..., description="The transcribed text from the audio.")
+    num_questions: int = Field(default=7, ge=3, le=15, description="Approximate number of questions to generate.")
+    # Optional: Specify desired types, otherwise model chooses variety
+    question_types: Optional[List[str]] = Field(default=None, description="Optional list of desired question types (e.g., ['Multiple Choice', 'Sentence Completion']).")
+    custom_prompt_instructions: Optional[str] = Field(default=None, description="Optional: Add custom instructions for the generation prompt.")
 
 # --- API Endpoints ---
 
@@ -331,7 +328,7 @@ async def api_root():
         "message": "Welcome to the Simplified Media API!",
         "status": "ok",
         "timestamp_utc": now,
-        "endpoints": ["/api/transcribe", "/api/translate", "/api/transcribe_youtube", "/docs"]
+        "endpoints": ["/api/transcribe", "/api/translate", "/api/generate_question", "/docs"]
     })
 
 @app.post("/api/transcribe", tags=["Transcription"])
@@ -417,111 +414,6 @@ async def transcribe_video(file: UploadFile = File(...)):
         logger.info(f"Cleaning up temporary directory: {temp_dir}")
         temp_dir_obj.cleanup()
 
-# @app.post("/api/transcribe_youtube", tags=["Transcription"])
-# async def transcribe_youtube(payload: YouTubeTranscribeRequest):
-#     """
-#     Downloads audio from a YouTube URL, extracts audio, and transcribes it.
-#     """
-#     if not pafy: raise HTTPException(status_code=501, detail="Pafy library not available.")
-#     if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
-#     if not mp:
-#         raise HTTPException(status_code=501, detail="MoviePy library not available.")
-
-#     # 1. Validate URL
-#     if not is_valid_youtube_url(payload.youtube_url):
-#         raise HTTPException(status_code=400, detail="Invalid or non-YouTube URL provided.")
-
-#     temp_dir_obj = tempfile.TemporaryDirectory(prefix="youtube_dl_")
-#     temp_dir = temp_dir_obj.name
-#     logger.info(f"Created temporary directory for YouTube download: {temp_dir}")
-
-#     try:
-#         loop = asyncio.get_running_loop()
-
-#         # 2. Download Audio using Pytube
-#         logger.info(f"Attempting to download audio for YouTube URL: {payload.youtube_url}")
-#         downloaded_file_path = None
-#         try:
-#             # Run synchronous pytube operations in executor
-#             _sync_download_partial = functools.partial(
-#                 _sync_download_pafy, # Call the new pafy helper
-#                 payload.youtube_url,
-#                 temp_dir
-#         )
-
-#             # Execute the download function
-#             downloaded_file_path = await loop.run_in_executor(None, _sync_download_partial)
-#             logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
-
-#         except RuntimeError as e: # Catch the specific retry failure error
-#             logger.error(f"RuntimeError from YouTube download: {e}")
-#             raise HTTPException(status_code=503, detail=str(e)) # Service Unavailable
-#         except FileNotFoundError as e:
-#             logger.error(f"{e}: File not found")
-#             raise HTTPException(status_code=404, detail=str(e)) # Service Unavailable
-#         except ValueError as e: # Catch our specific "no stream" error
-#              logger.error(f"ValueError during YouTube download: {e}")
-#              raise HTTPException(status_code=400, detail=str(e))
-#         except Exception as e: # Catch unexpected errors during download
-#              logger.error(f"Unexpected error during YouTube download: {e}", exc_info=True)
-#              raise HTTPException(status_code=500, detail="An unexpected error occurred during download.")
-
-
-#         # 3. Extract/Convert Audio to WAV using MoviePy (for consistency)
-#         if not downloaded_file_path or not os.path.exists(downloaded_file_path):
-#              logger.error("Downloaded audio file path is missing after pytube download.")
-#              raise HTTPException(status_code=500, detail="Audio download succeeded but file is missing.")
-
-#         base_name, _ = os.path.splitext(os.path.basename(downloaded_file_path))
-#         wav_audio_filename = f"{base_name}_extracted.wav"
-#         wav_audio_path = os.path.join(temp_dir, wav_audio_filename)
-
-#         logger.info(f"Extracting/Converting downloaded audio to WAV: {wav_audio_path}")
-#         try:
-#             # Use the existing moviepy function
-#             await extract_audio_moviepy(downloaded_file_path, wav_audio_path)
-#         except (RuntimeError, ValueError) as e:
-#             logger.error(f"Audio extraction failed for downloaded YouTube audio: {e}")
-#             raise HTTPException(status_code=500, detail=str(e)) # Pass detailed error
-#         except Exception as e:
-#             logger.error(f"Unexpected error during audio extraction: {e}", exc_info=True)
-#             raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly.")
-
-#         # 4. Transcribe the extracted WAV file
-#         if not os.path.exists(wav_audio_path):
-#              logger.error(f"WAV audio file missing after extraction: {wav_audio_path}")
-#              raise HTTPException(status_code=500, detail="Audio conversion did not produce a WAV file.")
-
-#         logger.info(f"Starting transcription for YouTube audio: {wav_audio_path}")
-#         transcription = await transcribe_audio_gemini(wav_audio_path)
-
-#         # Check for transcription errors
-#         if transcription.startswith("Error:"):
-#             logger.warning(f"Transcription failed for YouTube audio with message: {transcription}")
-#             status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
-#                           400 if "blocked" in transcription.lower() else 500
-#             raise HTTPException(status_code=status_code, detail=transcription)
-
-#         logger.info("YouTube Transcription successful.")
-
-#         # 5. Return the result
-#         return JSONResponse(content={
-#             "youtube_url": payload.youtube_url,
-#             "transcription": transcription,
-#             "engine": "Google Gemini API"
-#         })
-
-#     except HTTPException:
-#         raise # Re-raise exceptions we already handled
-#     except Exception as e:
-#         logger.error(f"An unexpected error occurred in transcribe_youtube endpoint: {e}", exc_info=True)
-#         raise HTTPException(status_code=500, detail="An internal server error occurred processing YouTube URL.")
-#     finally:
-#         # Cleanup temporary directory
-#         logger.info(f"Cleaning up YouTube temporary directory: {temp_dir}")
-#         temp_dir_obj.cleanup()
-
-
 @app.post("/api/translate", tags=["Translation"])
 async def translate_text_gemini(payload: TranslationRequest):
     """
@@ -567,7 +459,120 @@ async def translate_text_gemini(payload: TranslationRequest):
         # e.g., if e is google.api_core.exceptions.PermissionDenied: ...
         raise HTTPException(status_code=503, detail=f"Translation service failed: {e}")
 
+@app.post("/api/generate_questions", tags=["Question Generation"])
+async def generate_ielts_questions(payload: QuestionGenerationRequest):
+    """
+    Generates IELTS Listening-style questions based on provided transcript text using Gemini.
+    """
+    if not gemini_model:
+        raise HTTPException(status_code=501, detail="Gemini API client not configured.")
 
+    logger.info(f"Received request to generate ~{payload.num_questions} questions.")
+
+    # --- Construct the Prompt ---
+    prompt_parts = [
+        "You are an expert creator of IELTS Listening test questions.",
+        "Based *only* on the following transcript text, generate a set of IELTS Listening-style questions suitable for testing comprehension.",
+        f"Generate approximately {payload.num_questions} questions in total.",
+        "Include a variety of question types commonly found in IELTS Listening, such as:",
+        "  - Multiple Choice (with options A, B, C, etc.)",
+        "  - Sentence Completion (provide the sentence with a blank to fill)",
+        "  - Short Answer Questions (requiring a brief answer based on the text)",
+        "  - Matching (if distinct categories or items are discussed that can be matched)",
+        # Note: Map/Diagram Labeling is difficult without visuals, focus on text-based types unless explicitly asked via custom prompt.
+        "Ensure the questions directly test information stated or clearly implied in the transcript."
+    ]
+
+    # Add optional user-specified types
+    if payload.question_types:
+        types_str = ", ".join(payload.question_types)
+        prompt_parts.append(f"Focus primarily on these question types if possible: {types_str}.")
+    else:
+        prompt_parts.append("Ensure a good mix of different applicable question types.")
+
+    # Add optional custom instructions (ALLOWS FOR USER PROMPT ENGINEERING)
+    if payload.custom_prompt_instructions:
+        prompt_parts.append("\nFollow these additional instructions carefully:")
+        prompt_parts.append(payload.custom_prompt_instructions)
+
+    # Specify desired output format (JSON)
+    prompt_parts.append("\nFormat the output STRICTLY as a single JSON object containing a single key 'questions'.")
+    prompt_parts.append("The value of 'questions' should be a JSON array.")
+    prompt_parts.append("Each element in the array should be a JSON object representing one question, containing:")
+    prompt_parts.append("  - 'type': A string indicating the question type (e.g., 'Multiple Choice', 'Sentence Completion', 'Short Answer', 'Matching').")
+    prompt_parts.append("  - 'question_text': The full text of the question (including blanks for completion types).")
+    prompt_parts.append("  - 'options': (Optional) An array of strings for multiple choice options.")
+    prompt_parts.append("  - 'answer_guidance': (Optional) A brief note indicating where or how the answer can be found in the text (do NOT provide the actual answer itself).")
+
+    prompt_parts.append("\nHere is the transcript:\n--- TRANSCRIPT START ---")
+    prompt_parts.append(payload.transcript)
+    prompt_parts.append("--- TRANSCRIPT END ---")
+    prompt_parts.append("\nGenerate the JSON object now:")
+
+    final_prompt = "\n".join(prompt_parts)
+    # logger.debug(f"Gemini Prompt for Question Gen:\n{final_prompt}") # Uncomment to log the full prompt if debugging
+
+    # --- Call Gemini API ---
+    try:
+        logger.info("Sending request to Gemini API for question generation...")
+        loop = asyncio.get_running_loop()
+
+        # Use partial for the potentially long-running call
+        generate_func_partial = functools.partial(
+            gemini_model.generate_content,
+            final_prompt
+            # Add generation_config here if needed (e.g., temperature, max_output_tokens)
+            # generation_config=genai.types.GenerationConfig(temperature=0.7)
+        )
+
+        response = await loop.run_in_executor(None, generate_func_partial)
+
+        # --- Process Response ---
+        if not response.candidates:
+             logger.warning("Gemini question gen: Response has no candidates.")
+             block_reason = getattr(response.prompt_feedback, 'block_reason', None)
+             detail = f"Request blocked by safety filters: {block_reason}" if block_reason else "Generation failed (No response candidates)"
+             raise HTTPException(status_code=400, detail=detail)
+
+        generated_text = response.text
+        logger.info("Gemini question generation successful.")
+        # logger.debug(f"Raw Gemini Response Text:\n{generated_text}") # Uncomment for debugging
+
+        # Attempt to parse the response as JSON
+        try:
+            # Clean potential markdown code fences
+            cleaned_text = generated_text.strip().removeprefix("```json").removesuffix("```").strip()
+            questions_data = json.loads(cleaned_text)
+
+            # Basic validation of expected structure
+            if not isinstance(questions_data, dict) or "questions" not in questions_data or not isinstance(questions_data["questions"], list):
+                 logger.error(f"Gemini response parsed but has unexpected structure: {questions_data}")
+                 raise HTTPException(status_code=500, detail="Generated response has unexpected format, expected {'questions': [...]} ")
+
+            logger.info(f"Successfully parsed JSON response. Found {len(questions_data['questions'])} questions.")
+            return questions_data # Return the full dict {'questions': [...]}
+
+        except json.JSONDecodeError as json_err:
+            logger.error(f"Failed to parse Gemini response as JSON: {json_err}")
+            logger.error(f"Raw text received: {generated_text}")
+            # Return the raw text with a warning if JSON parsing fails
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse generated questions as JSON. Raw response: {generated_text}"
+            )
+
+    # --- Error Handling for API call ---
+    except google_api_exceptions.PermissionDenied as e:
+         if isinstance(e, google_api_exceptions.PermissionDenied):
+             logger.error(f"Gemini API Permission Denied: {e}", exc_info=True)
+             raise HTTPException(status_code=503, detail="Gemini API permission denied.")
+    except google_api_exceptions.ResourceExhausted as e:
+         if isinstance(e, google_api_exceptions.ResourceExhausted):
+             logger.error(f"Gemini API Quota Exceeded: {e}", exc_info=True)
+             raise HTTPException(status_code=503, detail="Gemini API quota limit reached.")
+    except Exception as e:
+        logger.error(f"Question generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during question generation ({type(e).__name__}).")
 # --- Optional: Add hello endpoint or others back if needed ---
 # @app.get("/api/hello", tags=["Greeting"])
 # async def hello_endpoint(name: str = "World"):
