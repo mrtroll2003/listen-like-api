@@ -22,6 +22,9 @@ import contextlib #debugging
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- Library Imports ---
 try:
@@ -46,9 +49,7 @@ try:
 except ImportError:
     logger.warning("yt-dlp backend not found. Pafy might use bundled youtube-dl or fail.")
 
-# --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
 
 app = FastAPI(title="Simplified Media API")
 
