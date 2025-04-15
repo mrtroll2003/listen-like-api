@@ -232,84 +232,84 @@ async def transcribe_audio_gemini(audio_path: str) -> str:
 
 
 # Link syntax checker/for regex
-YOUTUBE_DOMAINS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-}
+# YOUTUBE_DOMAINS = {
+#     "youtube.com",
+#     "www.youtube.com",
+#     "m.youtube.com",
+#     "youtu.be",
+# }
 
-def is_valid_youtube_url(url: str) -> bool:
-    """Checks if a string is a valid HTTP/HTTPS URL pointing to a known YouTube domain."""
-    try:
-        # Basic URL structure validation
-        parsed_url = urlparse(url)
-        if not all([parsed_url.scheme in ["http", "https"], parsed_url.netloc]):
-            logger.warning(f"URL validation failed (scheme/netloc): {url}")
-            return False
+# def is_valid_youtube_url(url: str) -> bool:
+#     """Checks if a string is a valid HTTP/HTTPS URL pointing to a known YouTube domain."""
+#     try:
+#         # Basic URL structure validation
+#         parsed_url = urlparse(url)
+#         if not all([parsed_url.scheme in ["http", "https"], parsed_url.netloc]):
+#             logger.warning(f"URL validation failed (scheme/netloc): {url}")
+#             return False
 
-        # Check if the domain is a known YouTube domain
-        domain = parsed_url.netloc.lower()
-        if domain not in YOUTUBE_DOMAINS:
-            # Handle youtu.be separately as netloc is just 'youtu.be'
-             if domain == 'youtu.be' and parsed_url.path and len(parsed_url.path) > 1:
-                 return True # youtu.be/VIDEO_ID is valid
-             logger.warning(f"URL validation failed (domain not YouTube): {domain}")
-             return False
+#         # Check if the domain is a known YouTube domain
+#         domain = parsed_url.netloc.lower()
+#         if domain not in YOUTUBE_DOMAINS:
+#             # Handle youtu.be separately as netloc is just 'youtu.be'
+#              if domain == 'youtu.be' and parsed_url.path and len(parsed_url.path) > 1:
+#                  return True # youtu.be/VIDEO_ID is valid
+#              logger.warning(f"URL validation failed (domain not YouTube): {domain}")
+#              return False
 
-        # For youtube.com domains, check for /watch path (basic check)
-        if "youtube.com" in domain: pass
-        return True
+#         # For youtube.com domains, check for /watch path (basic check)
+#         if "youtube.com" in domain: pass
+#         return True
 
-    except Exception as e:
-        logger.error(f"Error during URL parsing: {e}", exc_info=True)
-        return False
+#     except Exception as e:
+#         logger.error(f"Error during URL parsing: {e}", exc_info=True)
+#         return False
     
-def _sync_download_pafy(youtube_url: str, temp_dir: str) -> str:
-    """Synchronous helper to download audio using pafy."""
-    if not pafy:
-        raise RuntimeError("Pafy library is not available.")
-    try:
-        logger.info(f"Pafy: Creating video object for {youtube_url}")
-        video = pafy.new(youtube_url)
+# def _sync_download_pafy(youtube_url: str, temp_dir: str) -> str:
+#     """Synchronous helper to download audio using pafy."""
+#     if not pafy:
+#         raise RuntimeError("Pafy library is not available.")
+#     try:
+#         logger.info(f"Pafy: Creating video object for {youtube_url}")
+#         video = pafy.new(youtube_url)
 
-        logger.info(f"Pafy: Getting best audio stream for '{video.title}'")
-        best_audio = video.getbestaudio()
-        if not best_audio:
-            logger.error("Pafy: No suitable audio stream found.")
-            raise ValueError("Pafy could not find any audio stream for this video.")
+#         logger.info(f"Pafy: Getting best audio stream for '{video.title}'")
+#         best_audio = video.getbestaudio()
+#         if not best_audio:
+#             logger.error("Pafy: No suitable audio stream found.")
+#             raise ValueError("Pafy could not find any audio stream for this video.")
 
-        # Define target filename within temp_dir
-        # Use a generic name + pafy's extension
-        download_filename = f"youtube_audio_download.{best_audio.extension}"
-        download_filepath = os.path.join(temp_dir, download_filename)
+#         # Define target filename within temp_dir
+#         # Use a generic name + pafy's extension
+#         download_filename = f"youtube_audio_download.{best_audio.extension}"
+#         download_filepath = os.path.join(temp_dir, download_filename)
 
-        logger.info(f"Pafy: Downloading audio stream {best_audio.bitrate} {best_audio.extension} to {download_filepath}")
-        # filepath arg directs the download location
-        actual_filepath = best_audio.download(filepath=download_filepath, quiet=True) # quiet=True suppresses console progress
-        logger.info(f"Pafy: Download complete. File saved at: {actual_filepath}")
+#         logger.info(f"Pafy: Downloading audio stream {best_audio.bitrate} {best_audio.extension} to {download_filepath}")
+#         # filepath arg directs the download location
+#         actual_filepath = best_audio.download(filepath=download_filepath, quiet=True) # quiet=True suppresses console progress
+#         logger.info(f"Pafy: Download complete. File saved at: {actual_filepath}")
 
-        # Sometimes pafy might return a slightly different path/filename than requested, use the returned one
-        if not os.path.exists(actual_filepath):
-             logger.error(f"Pafy download reported success but file not found at {actual_filepath}")
-             # Check original path too just in case
-             if os.path.exists(download_filepath):
-                 logger.warning(f"Pafy download found at requested path {download_filepath} despite returning different path.")
-                 return download_filepath
-             raise FileNotFoundError("Downloaded file not found after pafy download.")
+#         # Sometimes pafy might return a slightly different path/filename than requested, use the returned one
+#         if not os.path.exists(actual_filepath):
+#              logger.error(f"Pafy download reported success but file not found at {actual_filepath}")
+#              # Check original path too just in case
+#              if os.path.exists(download_filepath):
+#                  logger.warning(f"Pafy download found at requested path {download_filepath} despite returning different path.")
+#                  return download_filepath
+#              raise FileNotFoundError("Downloaded file not found after pafy download.")
 
-        return actual_filepath # Return the path where the file was actually saved
+#         return actual_filepath # Return the path where the file was actually saved
 
-    except (ValueError, IOError, OSError, KeyError, AttributeError) as e: # Catch common pafy/download issues
-        # Pafy doesn't have super specific exceptions documented well, catch broad categories
-        logger.error(f"Pafy: Error processing URL {youtube_url}: {e}", exc_info=True)
-        # Check if it looks like a 4xx error (like 404 Not Found, 403 Forbidden)
-        if "HTTP Error 4" in str(e):
-             raise ValueError(f"Video not found or access denied ({type(e).__name__}: {e})") # Raise specific error type if possible
-        raise RuntimeError(f"Pafy failed to process video/download audio: {type(e).__name__}: {e}")
-    except Exception as e: # Catch any other unexpected error
-         logger.error(f"Pafy: Unexpected error for {youtube_url}: {e}", exc_info=True)
-         raise RuntimeError(f"Unexpected error during Pafy download: {type(e).__name__}: {e}")
+#     except (ValueError, IOError, OSError, KeyError, AttributeError) as e: # Catch common pafy/download issues
+#         # Pafy doesn't have super specific exceptions documented well, catch broad categories
+#         logger.error(f"Pafy: Error processing URL {youtube_url}: {e}", exc_info=True)
+#         # Check if it looks like a 4xx error (like 404 Not Found, 403 Forbidden)
+#         if "HTTP Error 4" in str(e):
+#              raise ValueError(f"Video not found or access denied ({type(e).__name__}: {e})") # Raise specific error type if possible
+#         raise RuntimeError(f"Pafy failed to process video/download audio: {type(e).__name__}: {e}")
+#     except Exception as e: # Catch any other unexpected error
+#          logger.error(f"Pafy: Unexpected error for {youtube_url}: {e}", exc_info=True)
+#          raise RuntimeError(f"Unexpected error during Pafy download: {type(e).__name__}: {e}")
 
 
 # --- Pydantic Models ---
@@ -417,109 +417,109 @@ async def transcribe_video(file: UploadFile = File(...)):
         logger.info(f"Cleaning up temporary directory: {temp_dir}")
         temp_dir_obj.cleanup()
 
-@app.post("/api/transcribe_youtube", tags=["Transcription"])
-async def transcribe_youtube(payload: YouTubeTranscribeRequest):
-    """
-    Downloads audio from a YouTube URL, extracts audio, and transcribes it.
-    """
-    if not pafy: raise HTTPException(status_code=501, detail="Pafy library not available.")
-    if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
-    if not mp:
-        raise HTTPException(status_code=501, detail="MoviePy library not available.")
+# @app.post("/api/transcribe_youtube", tags=["Transcription"])
+# async def transcribe_youtube(payload: YouTubeTranscribeRequest):
+#     """
+#     Downloads audio from a YouTube URL, extracts audio, and transcribes it.
+#     """
+#     if not pafy: raise HTTPException(status_code=501, detail="Pafy library not available.")
+#     if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
+#     if not mp:
+#         raise HTTPException(status_code=501, detail="MoviePy library not available.")
 
-    # 1. Validate URL
-    if not is_valid_youtube_url(payload.youtube_url):
-        raise HTTPException(status_code=400, detail="Invalid or non-YouTube URL provided.")
+#     # 1. Validate URL
+#     if not is_valid_youtube_url(payload.youtube_url):
+#         raise HTTPException(status_code=400, detail="Invalid or non-YouTube URL provided.")
 
-    temp_dir_obj = tempfile.TemporaryDirectory(prefix="youtube_dl_")
-    temp_dir = temp_dir_obj.name
-    logger.info(f"Created temporary directory for YouTube download: {temp_dir}")
+#     temp_dir_obj = tempfile.TemporaryDirectory(prefix="youtube_dl_")
+#     temp_dir = temp_dir_obj.name
+#     logger.info(f"Created temporary directory for YouTube download: {temp_dir}")
 
-    try:
-        loop = asyncio.get_running_loop()
+#     try:
+#         loop = asyncio.get_running_loop()
 
-        # 2. Download Audio using Pytube
-        logger.info(f"Attempting to download audio for YouTube URL: {payload.youtube_url}")
-        downloaded_file_path = None
-        try:
-            # Run synchronous pytube operations in executor
-            _sync_download_partial = functools.partial(
-                _sync_download_pafy, # Call the new pafy helper
-                payload.youtube_url,
-                temp_dir
-        )
+#         # 2. Download Audio using Pytube
+#         logger.info(f"Attempting to download audio for YouTube URL: {payload.youtube_url}")
+#         downloaded_file_path = None
+#         try:
+#             # Run synchronous pytube operations in executor
+#             _sync_download_partial = functools.partial(
+#                 _sync_download_pafy, # Call the new pafy helper
+#                 payload.youtube_url,
+#                 temp_dir
+#         )
 
-            # Execute the download function
-            downloaded_file_path = await loop.run_in_executor(None, _sync_download_partial)
-            logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
+#             # Execute the download function
+#             downloaded_file_path = await loop.run_in_executor(None, _sync_download_partial)
+#             logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
 
-        except RuntimeError as e: # Catch the specific retry failure error
-            logger.error(f"RuntimeError from YouTube download: {e}")
-            raise HTTPException(status_code=503, detail=str(e)) # Service Unavailable
-        except FileNotFoundError as e:
-            logger.error(f"{e}: File not found")
-            raise HTTPException(status_code=404, detail=str(e)) # Service Unavailable
-        except ValueError as e: # Catch our specific "no stream" error
-             logger.error(f"ValueError during YouTube download: {e}")
-             raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e: # Catch unexpected errors during download
-             logger.error(f"Unexpected error during YouTube download: {e}", exc_info=True)
-             raise HTTPException(status_code=500, detail="An unexpected error occurred during download.")
+#         except RuntimeError as e: # Catch the specific retry failure error
+#             logger.error(f"RuntimeError from YouTube download: {e}")
+#             raise HTTPException(status_code=503, detail=str(e)) # Service Unavailable
+#         except FileNotFoundError as e:
+#             logger.error(f"{e}: File not found")
+#             raise HTTPException(status_code=404, detail=str(e)) # Service Unavailable
+#         except ValueError as e: # Catch our specific "no stream" error
+#              logger.error(f"ValueError during YouTube download: {e}")
+#              raise HTTPException(status_code=400, detail=str(e))
+#         except Exception as e: # Catch unexpected errors during download
+#              logger.error(f"Unexpected error during YouTube download: {e}", exc_info=True)
+#              raise HTTPException(status_code=500, detail="An unexpected error occurred during download.")
 
 
-        # 3. Extract/Convert Audio to WAV using MoviePy (for consistency)
-        if not downloaded_file_path or not os.path.exists(downloaded_file_path):
-             logger.error("Downloaded audio file path is missing after pytube download.")
-             raise HTTPException(status_code=500, detail="Audio download succeeded but file is missing.")
+#         # 3. Extract/Convert Audio to WAV using MoviePy (for consistency)
+#         if not downloaded_file_path or not os.path.exists(downloaded_file_path):
+#              logger.error("Downloaded audio file path is missing after pytube download.")
+#              raise HTTPException(status_code=500, detail="Audio download succeeded but file is missing.")
 
-        base_name, _ = os.path.splitext(os.path.basename(downloaded_file_path))
-        wav_audio_filename = f"{base_name}_extracted.wav"
-        wav_audio_path = os.path.join(temp_dir, wav_audio_filename)
+#         base_name, _ = os.path.splitext(os.path.basename(downloaded_file_path))
+#         wav_audio_filename = f"{base_name}_extracted.wav"
+#         wav_audio_path = os.path.join(temp_dir, wav_audio_filename)
 
-        logger.info(f"Extracting/Converting downloaded audio to WAV: {wav_audio_path}")
-        try:
-            # Use the existing moviepy function
-            await extract_audio_moviepy(downloaded_file_path, wav_audio_path)
-        except (RuntimeError, ValueError) as e:
-            logger.error(f"Audio extraction failed for downloaded YouTube audio: {e}")
-            raise HTTPException(status_code=500, detail=str(e)) # Pass detailed error
-        except Exception as e:
-            logger.error(f"Unexpected error during audio extraction: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly.")
+#         logger.info(f"Extracting/Converting downloaded audio to WAV: {wav_audio_path}")
+#         try:
+#             # Use the existing moviepy function
+#             await extract_audio_moviepy(downloaded_file_path, wav_audio_path)
+#         except (RuntimeError, ValueError) as e:
+#             logger.error(f"Audio extraction failed for downloaded YouTube audio: {e}")
+#             raise HTTPException(status_code=500, detail=str(e)) # Pass detailed error
+#         except Exception as e:
+#             logger.error(f"Unexpected error during audio extraction: {e}", exc_info=True)
+#             raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly.")
 
-        # 4. Transcribe the extracted WAV file
-        if not os.path.exists(wav_audio_path):
-             logger.error(f"WAV audio file missing after extraction: {wav_audio_path}")
-             raise HTTPException(status_code=500, detail="Audio conversion did not produce a WAV file.")
+#         # 4. Transcribe the extracted WAV file
+#         if not os.path.exists(wav_audio_path):
+#              logger.error(f"WAV audio file missing after extraction: {wav_audio_path}")
+#              raise HTTPException(status_code=500, detail="Audio conversion did not produce a WAV file.")
 
-        logger.info(f"Starting transcription for YouTube audio: {wav_audio_path}")
-        transcription = await transcribe_audio_gemini(wav_audio_path)
+#         logger.info(f"Starting transcription for YouTube audio: {wav_audio_path}")
+#         transcription = await transcribe_audio_gemini(wav_audio_path)
 
-        # Check for transcription errors
-        if transcription.startswith("Error:"):
-            logger.warning(f"Transcription failed for YouTube audio with message: {transcription}")
-            status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
-                          400 if "blocked" in transcription.lower() else 500
-            raise HTTPException(status_code=status_code, detail=transcription)
+#         # Check for transcription errors
+#         if transcription.startswith("Error:"):
+#             logger.warning(f"Transcription failed for YouTube audio with message: {transcription}")
+#             status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
+#                           400 if "blocked" in transcription.lower() else 500
+#             raise HTTPException(status_code=status_code, detail=transcription)
 
-        logger.info("YouTube Transcription successful.")
+#         logger.info("YouTube Transcription successful.")
 
-        # 5. Return the result
-        return JSONResponse(content={
-            "youtube_url": payload.youtube_url,
-            "transcription": transcription,
-            "engine": "Google Gemini API"
-        })
+#         # 5. Return the result
+#         return JSONResponse(content={
+#             "youtube_url": payload.youtube_url,
+#             "transcription": transcription,
+#             "engine": "Google Gemini API"
+#         })
 
-    except HTTPException:
-        raise # Re-raise exceptions we already handled
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in transcribe_youtube endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred processing YouTube URL.")
-    finally:
-        # Cleanup temporary directory
-        logger.info(f"Cleaning up YouTube temporary directory: {temp_dir}")
-        temp_dir_obj.cleanup()
+#     except HTTPException:
+#         raise # Re-raise exceptions we already handled
+#     except Exception as e:
+#         logger.error(f"An unexpected error occurred in transcribe_youtube endpoint: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail="An internal server error occurred processing YouTube URL.")
+#     finally:
+#         # Cleanup temporary directory
+#         logger.info(f"Cleaning up YouTube temporary directory: {temp_dir}")
+#         temp_dir_obj.cleanup()
 
 
 @app.post("/api/translate", tags=["Translation"])
