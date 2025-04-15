@@ -38,14 +38,16 @@ except ImportError:
     google_api_exceptions = None
 
 try:
-    from pytube import YouTube
-    from pytube.exceptions import PytubeError, VideoUnavailable, RegexMatchError
+    import pafy
+    # Check if backend yt-dlp is available (optional but good practice)
+    try:
+        import yt_dlp
+        logger.info("yt-dlp backend found for pafy.")
+    except ImportError:
+         logger.warning("yt-dlp backend not found. Pafy might use bundled youtube-dl or fail.")
 except ImportError:
-     logging.error("Pytube library not found. pip install pytube")
-     YouTube = None
-     PytubeError = None # Define base exception for broader catch if needed
-     VideoUnavailable = None
-     RegexMatchError = None
+     logging.error("Pafy library not found. pip install pafy yt-dlp")
+     pafy = None
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -263,6 +265,53 @@ def is_valid_youtube_url(url: str) -> bool:
     except Exception as e:
         logger.error(f"Error during URL parsing: {e}", exc_info=True)
         return False
+    
+def _sync_download_pafy(youtube_url: str, temp_dir: str) -> str:
+    """Synchronous helper to download audio using pafy."""
+    if not pafy:
+        raise RuntimeError("Pafy library is not available.")
+    try:
+        logger.info(f"Pafy: Creating video object for {youtube_url}")
+        video = pafy.new(youtube_url)
+
+        logger.info(f"Pafy: Getting best audio stream for '{video.title}'")
+        best_audio = video.getbestaudio()
+        if not best_audio:
+            logger.error("Pafy: No suitable audio stream found.")
+            raise ValueError("Pafy could not find any audio stream for this video.")
+
+        # Define target filename within temp_dir
+        # Use a generic name + pafy's extension
+        download_filename = f"youtube_audio_download.{best_audio.extension}"
+        download_filepath = os.path.join(temp_dir, download_filename)
+
+        logger.info(f"Pafy: Downloading audio stream {best_audio.bitrate} {best_audio.extension} to {download_filepath}")
+        # filepath arg directs the download location
+        actual_filepath = best_audio.download(filepath=download_filepath, quiet=True) # quiet=True suppresses console progress
+        logger.info(f"Pafy: Download complete. File saved at: {actual_filepath}")
+
+        # Sometimes pafy might return a slightly different path/filename than requested, use the returned one
+        if not os.path.exists(actual_filepath):
+             logger.error(f"Pafy download reported success but file not found at {actual_filepath}")
+             # Check original path too just in case
+             if os.path.exists(download_filepath):
+                 logger.warning(f"Pafy download found at requested path {download_filepath} despite returning different path.")
+                 return download_filepath
+             raise FileNotFoundError("Downloaded file not found after pafy download.")
+
+        return actual_filepath # Return the path where the file was actually saved
+
+    except (ValueError, IOError, OSError, KeyError, AttributeError) as e: # Catch common pafy/download issues
+        # Pafy doesn't have super specific exceptions documented well, catch broad categories
+        logger.error(f"Pafy: Error processing URL {youtube_url}: {e}", exc_info=True)
+        # Check if it looks like a 4xx error (like 404 Not Found, 403 Forbidden)
+        if "HTTP Error 4" in str(e):
+             raise ValueError(f"Video not found or access denied ({type(e).__name__}: {e})") # Raise specific error type if possible
+        raise RuntimeError(f"Pafy failed to process video/download audio: {type(e).__name__}: {e}")
+    except Exception as e: # Catch any other unexpected error
+         logger.error(f"Pafy: Unexpected error for {youtube_url}: {e}", exc_info=True)
+         raise RuntimeError(f"Unexpected error during Pafy download: {type(e).__name__}: {e}")
+
 
 # --- Pydantic Models ---
 class TranslationRequest(BaseModel):
@@ -374,8 +423,7 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
     """
     Downloads audio from a YouTube URL, extracts audio, and transcribes it.
     """
-    if not YouTube:
-        raise HTTPException(status_code=501, detail="Pytube library not available.")
+    if not pafy: raise HTTPException(status_code=501, detail="Pafy library not available.")
     if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
     if not mp:
         raise HTTPException(status_code=501, detail="MoviePy library not available.")
@@ -396,70 +444,22 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
         downloaded_file_path = None
         try:
             # Run synchronous pytube operations in executor
-            def _sync_download():
-                MAX_RETRIES = 3
-                INITIAL_WAIT_SECONDS = 1.5 # Start with 1.5 seconds
-
-                for attempt in range(MAX_RETRIES):
-                    try:
-                        logger.info(f"YouTube Download Attempt {attempt + 1}/{MAX_RETRIES}")
-                        yt = YouTube(payload.youtube_url) # Use the payload from the outer scope
-
-                        # --- Get stream info ---
-                        # This is often the part that gets rate-limited first
-                        audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
-                        if not audio_stream:
-                            logger.warning("No MP4 audio stream found, trying any audio stream...")
-                            audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-                        if not audio_stream:
-                            logger.error("No suitable audio stream found for this YouTube video.")
-                            raise ValueError("No suitable audio-only stream found.")
-                            # --- End get stream info ---
-
-                        logger.info(f"Selected audio stream: itag={audio_stream.itag}, abr={audio_stream.abr}, type={audio_stream.mime_type}")
-                        download_filename = "youtube_audio_download"
-                        # --- Perform download ---
-                        downloaded_path = audio_stream.download(output_path=temp_dir, filename=download_filename) # Use temp_dir from outer scope
-                        logger.info(f"Download successful on attempt {attempt + 1}")
-                        return downloaded_path # Success! Exit the loop and function.
-                        # --- End perform download ---
-
-                    except urllib.error.HTTPError as e:
-                        if e.code == 429: # Specifically catch "Too Many Requests"
-                            wait_time = INITIAL_WAIT_SECONDS * (2 ** attempt) # Exponential backoff (1.5s, 3s, 6s)
-                            logger.warning(f"HTTP 429 Too Many Requests. Retrying in {wait_time:.1f} seconds...")
-                            if attempt < MAX_RETRIES - 1: # Don't sleep after the last attempt
-                                time.sleep(wait_time)
-                            continue # Go to the next attempt in the loop
-                        else:
-                # Re-raise other HTTPErrors immediately
-                            logger.error(f"HTTP Error during YouTube download (Code {e.code}): {e}")
-                            raise # Re-raise the original error
-                    except Exception as e:
-             # Catch other potential errors during this attempt
-                        logger.error(f"Error during YouTube download attempt {attempt + 1}: {e}", exc_info=True)
-             # Depending on the error, you might want to break or continue
-             # For now, let's break on any other error during an attempt
-                        raise # Re-raise the error to be caught by the outer handler
-
-        # If the loop finishes without returning (i.e., all retries failed)
-                logger.error(f"YouTube download failed after {MAX_RETRIES} attempts due to rate limiting or other errors.")
-        # Raise a specific error indicating retry failure
-                raise RuntimeError(f"Failed to download YouTube audio after {MAX_RETRIES} attempts (Likely rate-limited).")
+            _sync_download_partial = functools.partial(
+                _sync_download_pafy, # Call the new pafy helper
+                payload.youtube_url,
+                temp_dir
+        )
 
             # Execute the download function
-            downloaded_file_path = await loop.run_in_executor(None, _sync_download)
+            downloaded_file_path = await loop.run_in_executor(None, _sync_download_partial)
             logger.info(f"Successfully downloaded YouTube audio to: {downloaded_file_path}")
 
         except RuntimeError as e: # Catch the specific retry failure error
             logger.error(f"RuntimeError from YouTube download: {e}")
             raise HTTPException(status_code=503, detail=str(e)) # Service Unavailable
-        except (VideoUnavailable, RegexMatchError) as e:
-            logger.error(f"Pytube error: Video unavailable or URL regex failed for {payload.youtube_url}: {e}", exc_info=True)
-            raise HTTPException(status_code=404, detail=f"Video not found or unavailable: {e}")
-        except PytubeError as e: # Catch other general pytube errors
-             logger.error(f"Pytube error downloading {payload.youtube_url}: {e}", exc_info=True)
-             raise HTTPException(status_code=500, detail=f"Failed to download YouTube audio: {e}")
+        except FileNotFoundError as e:
+            logger.error(f"{e}: File not found")
+            raise HTTPException(status_code=404, detail=str(e)) # Service Unavailable
         except ValueError as e: # Catch our specific "no stream" error
              logger.error(f"ValueError during YouTube download: {e}")
              raise HTTPException(status_code=400, detail=str(e))
@@ -509,7 +509,7 @@ async def transcribe_youtube(payload: YouTubeTranscribeRequest):
         return JSONResponse(content={
             "youtube_url": payload.youtube_url,
             "transcription": transcription,
-            "engine": "SpeechRecognition (Google Web Speech API)"
+            "engine": "Google Gemini API"
         })
 
     except HTTPException:
