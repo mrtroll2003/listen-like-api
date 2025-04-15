@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 import logging
 import datetime
+import pafy
 from pydantic import BaseModel, HttpUrl, ValidationError
 import re # Added for regex
 from urllib.parse import urlparse
@@ -37,17 +38,14 @@ except ImportError:
     genai = None
     google_api_exceptions = None
 
-try:
-    import pafy
+
     # Check if backend yt-dlp is available (optional but good practice)
-    try:
-        import yt_dlp
-        logger.info("yt-dlp backend found for pafy.")
-    except ImportError:
-         logger.warning("yt-dlp backend not found. Pafy might use bundled youtube-dl or fail.")
+try:
+    import yt_dlp
+    logger.info("yt-dlp backend found for pafy.")
 except ImportError:
-     logging.error("Pafy library not found. pip install pafy yt-dlp")
-     pafy = None
+    logger.warning("yt-dlp backend not found. Pafy might use bundled youtube-dl or fail.")
+
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
