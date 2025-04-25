@@ -23,6 +23,7 @@ import contextlib #debugging
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,6 +45,25 @@ except ImportError:
 
 app = FastAPI(title="Simplified Media API")
 
+# --- Cross origin (CORS) import
+origins = [
+    "http://localhost", # Base localhost
+    "http://localhost:8080", # Example default Flutter web server port
+    "http://localhost:55363", # The port shown in your flutter run output
+    "http://localhost:62812/",
+    # Add the URL where your Flutter Web app will be HOSTED eventually
+    # e.g., "https://your-flutter-app.vercel.app",
+    # e.g., "https://your-flutter-app-on-render.onrender.com"
+    # "*" # Allow all origins (use with caution)
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins, # List of allowed origins
+    allow_credentials=True, # Allows cookies (if you use them later)
+    allow_methods=["*"], # Allow all methods (GET, POST, PUT, etc.)
+    allow_headers=["*"], # Allow all headers
+)
 
 # --- Google Gemini Setup ---
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
