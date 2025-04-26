@@ -50,8 +50,8 @@ origins = [
     "http://localhost", # Base localhost
     "http://localhost:8080", # Example default Flutter web server port
     "http://localhost:55363", # The port shown in your flutter run output
-    "http://localhost:62812/",
-    "https://listen-like.onrender.com/",
+    "http://localhost:62812",
+    "https://listen-like.onrender.com",
     "https://listen-like.onrender.com/Result",
     # Add the URL where your Flutter Web app will be HOSTED eventually
     # e.g., "https://your-flutter-app.vercel.app",
