@@ -8,7 +8,7 @@ import asyncio
 from pathlib import Path
 import logging
 import datetime
-from pydantic import BaseModel, HttpUrl, ValidationError, Field
+from pydantic import BaseModel, HttpUrl, ValidationError, Field, field_validator
 from typing import Optional, List # Added List
 import re # Added for regex
 from urllib.parse import urlparse
@@ -79,8 +79,8 @@ elif not genai:
 else:
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-        logger.info("Google Gemini client configured successfully with gemini-2.0-flash.")
+        gemini_model = genai.GenerativeModel('gemini-2.5-pro-preview-03-25')
+        logger.info("Google Gemini client configured successfully with gemini-2.5-pro-preview-03-25.")
     except Exception as e:
         logger.error(f"Failed to configure Google Gemini: {e}", exc_info=True)
         gemini_model = None # Ensure it's None if setup fails
@@ -159,171 +159,108 @@ async def extract_audio_moviepy(video_path: str, audio_path: str):
 
 
 # --- Helper Function: Transcription  ---
-async def transcribe_audio_gemini(audio_path: str) -> str:
+async def transcribe_via_gemini(source_uri_or_path: str, is_youtube_uri: bool = False) -> str:
     """
-    Transcribes audio from a file using the Google Gemini API.
-    Uploads the file and sends it with a transcription prompt.
+    Transcribes audio/video using Gemini.
+    Handles either a local file path or a YouTube URI.
+    Requests JSON output with timestamps.
     """
     if not genai or not gemini_model:
         raise RuntimeError("Gemini API client not configured or library not available.")
 
-    uploaded_file = None
+    uploaded_file_part = None
+    prompt = """Please provide a transcription for the following video/audio in JSON format.
+            The JSON should be an array of objects. Each object must have the following keys:
+            - "start": The start time of the spoken segment in seconds (float or integer).
+            - "end": The end time of the spoken segment in seconds (float or integer).
+            - "text": The transcribed text for that segment (string).
+            Example object: {"start": 4.67, "end": 5.83, "text": "All pilots, prepare to sortie."}
+            Ensure the entire output is **only** the valid JSON array, starting with '[' and ending with ']'. Do not include markdown fences like ```json or any introductory text."""
+
     try:
-        # 1. Determine MIME type
-        mime_type, _ = mimetypes.guess_type(audio_path)
-        if not mime_type or not mime_type.startswith("audio/"):
-            # Default or fallback if guess fails for common types
-            if audio_path.lower().endswith(".wav"): mime_type = "audio/wav"
-            elif audio_path.lower().endswith(".mp3"): mime_type = "audio/mpeg"
-            elif audio_path.lower().endswith(".ogg"): mime_type = "audio/ogg"
-            # Add more if needed, or raise error
-            else: mime_type = "application/octet-stream" # Generic fallback
-            logger.warning(f"Could not guess MIME type for {audio_path}, using {mime_type}")
+        if is_youtube_uri:
+            logger.info(f"Gemini: Using YouTube URI for transcription: {source_uri_or_path}")
+            # Directly use the validated YouTube URL as a URI part
+            uploaded_file_part = types.Part.from_uri(
+                file_uri=source_uri_or_path,
+                mime_type="video/youtube" # Inform Gemini it's a YouTube link
+            )
+        else: # It's a local file path
+            # 1. Determine MIME type for local file
+            mime_type, _ = mimetypes.guess_type(source_uri_or_path)
+            if not mime_type or not (mime_type.startswith("audio/") or mime_type.startswith("video/")):
+                # Add specific fallbacks if needed
+                if source_uri_or_path.lower().endswith(".mp3"): mime_type = "audio/mpeg"
+                elif source_uri_or_path.lower().endswith(".wav"): mime_type = "audio/wav"
+                elif source_uri_or_path.lower().endswith(".mp4"): mime_type = "video/mp4"
+                # Add others based on expected formats
+                else: mime_type = "application/octet-stream"
+                logger.warning(f"Could not guess MIME type for local file: {source_uri_or_path}, using {mime_type}")
 
-        # 2. Upload the audio file
-        logger.info(f"Gemini: Uploading audio file: {audio_path} (MIME: {mime_type})")
-        # Run synchronous SDK call in executor
+            # 2. Upload the local file
+            logger.info(f"Gemini: Uploading local file: {source_uri_or_path} (MIME: {mime_type})")
+            loop = asyncio.get_running_loop()
+            upload_func_partial = functools.partial(genai.upload_file, path=source_uri_or_path, mime_type=mime_type)
+            uploaded_file_obj = await loop.run_in_executor(None, upload_func_partial)
+            logger.info(f"Gemini: Local file uploaded successfully. URI: {uploaded_file_obj.uri}")
+            uploaded_file_part = uploaded_file_obj # Use the uploaded file object
+
+        if not uploaded_file_part:
+             raise RuntimeError("Failed to prepare input part for Gemini.")
+
+        # 3. Generate content
+        logger.info("Gemini: Sending transcription request with JSON format instruction...")
         loop = asyncio.get_running_loop()
-        upload_func_partial = functools.partial(
-            genai.upload_file,
-            path=audio_path,      # Pass args intended for upload_file here
-            mime_type=mime_type
-        )
-        uploaded_file = await loop.run_in_executor(
-            None,
-            upload_func_partial
-        )
-        logger.info(f"Gemini: File uploaded successfully. URI: {uploaded_file.uri}")
 
-        # 3. Generate content with prompt and uploaded file
-        prompt = "Please transcribe the following audio file."
-        logger.info("Gemini: Sending transcription request...")
+        # Prepare contents list correctly
+        contents = [uploaded_file_part, prompt] # Send file/uri part AND prompt part
 
         generate_func_partial = functools.partial(
             gemini_model.generate_content,
-            [prompt, uploaded_file] # Arguments for generate_content
-            # Add other generate_content args here if needed (e.g., generation_config)
+            contents=contents
+            # Specify JSON mode if model supports it explicitly (check Gemini docs/versions)
+            # generation_config=genai.GenerationConfig(response_mime_type="application/json")
         )
-        # Make the generate_content call in executor
-        response = await loop.run_in_executor(
-            None,
-            generate_func_partial   # Call the pre-configured function
-        )
+        response = await loop.run_in_executor(None, generate_func_partial)
 
         # Check for potential blocks or empty responses
         if not response.candidates:
-             logger.warning("Gemini: Response has no candidates. Possibly blocked or empty.")
-             # Try accessing prompt feedback for block reason
+             logger.warning("Gemini: Response has no candidates.")
              block_reason = getattr(response.prompt_feedback, 'block_reason', None)
-             if block_reason:
-                 return f"Error: Transcription request blocked by safety filters: {block_reason}"
-             else:
-                 return "Error: Transcription failed (No response candidates)"
+             reason = f"Blocked by safety filters: {block_reason}" if block_reason else "No response candidates"
+             raise RuntimeError(f"Transcription failed ({reason})")
 
-        # Extract text from the first candidate
-        # Assuming the transcription is in response.text or parts
-        transcription = response.text
-        logger.info("Gemini: Transcription received successfully.")
-        return transcription
+        # Extract text - expecting JSON string
+        transcription_json_string = response.text
+        logger.info("Gemini: Transcription response received.")
+        # logger.debug(f"Raw Gemini Transcription Response:\n{transcription_json_string}") # Debug
 
-    except google_api_exceptions.PermissionDenied as e:
-         logger.error(f"Gemini API Permission Denied: {e}", exc_info=True)
-         return "Error: Gemini API permission denied. Check your API key and permissions."
-    except google_api_exceptions.ResourceExhausted as e:
-         logger.error(f"Gemini API Quota Exceeded: {e}", exc_info=True)
-         return "Error: Gemini API quota limit reached. Please try again later."
+        # Validate and return the JSON string
+        try:
+             # Clean potential markdown fences just in case model adds them
+             cleaned_json = transcription_json_string.strip().removeprefix("```json").removesuffix("```").strip()
+             # Try parsing to ensure it's valid JSON
+             json.loads(cleaned_json)
+             return cleaned_json # Return the JSON string itself
+        except json.JSONDecodeError as json_err:
+             logger.error(f"Gemini response was not valid JSON: {json_err}. Response text: {transcription_json_string}")
+             raise RuntimeError("Transcription failed: Model did not return valid JSON.")
+
+    except (google_api_exceptions.PermissionDenied, google_api_exceptions.ResourceExhausted) as e:
+        # Handle specific Google API errors
+        status = "Permission Denied" if isinstance(e, google_api_exceptions.PermissionDenied) else "Quota Exceeded"
+        logger.error(f"Gemini API {status}: {e}", exc_info=True)
+        raise RuntimeError(f"Transcription failed: Gemini API {status.lower()}. Check key/quota.")
     except Exception as e:
         logger.error(f"Gemini transcription failed: {e}", exc_info=True)
-        # Provide a general error, specific details logged
-        return f"Error: An unexpected error occurred during Gemini transcription ({type(e).__name__})."
+        raise RuntimeError(f"An unexpected error occurred during Gemini transcription ({type(e).__name__}).")
     finally:
         # Optional: Delete the uploaded file from Gemini storage if desired
         # This might require tracking the uploaded_file.name and calling genai.delete_file()
         # For simplicity, we omit this now, but be aware files might persist temporarily.
-        if uploaded_file:
-            logger.debug(f"Gemini: Uploaded file object: name={uploaded_file.name}, uri={uploaded_file.uri}")
+        if uploaded_file_part:
+            logger.debug(f"Gemini: Uploaded file object: name={uploaded_file_part.name}, uri={uploaded_file_part.uri}")
             # Consider adding deletion logic here if managing storage is critical
-
-
-# Link syntax checker/for regex
-# YOUTUBE_DOMAINS = {
-#     "youtube.com",
-#     "www.youtube.com",
-#     "m.youtube.com",
-#     "youtu.be",
-# }
-
-# def is_valid_youtube_url(url: str) -> bool:
-#     """Checks if a string is a valid HTTP/HTTPS URL pointing to a known YouTube domain."""
-#     try:
-#         # Basic URL structure validation
-#         parsed_url = urlparse(url)
-#         if not all([parsed_url.scheme in ["http", "https"], parsed_url.netloc]):
-#             logger.warning(f"URL validation failed (scheme/netloc): {url}")
-#             return False
-
-#         # Check if the domain is a known YouTube domain
-#         domain = parsed_url.netloc.lower()
-#         if domain not in YOUTUBE_DOMAINS:
-#             # Handle youtu.be separately as netloc is just 'youtu.be'
-#              if domain == 'youtu.be' and parsed_url.path and len(parsed_url.path) > 1:
-#                  return True # youtu.be/VIDEO_ID is valid
-#              logger.warning(f"URL validation failed (domain not YouTube): {domain}")
-#              return False
-
-#         # For youtube.com domains, check for /watch path (basic check)
-#         if "youtube.com" in domain: pass
-#         return True
-
-#     except Exception as e:
-#         logger.error(f"Error during URL parsing: {e}", exc_info=True)
-#         return False
-    
-# def _sync_download_pafy(youtube_url: str, temp_dir: str) -> str:
-#     """Synchronous helper to download audio using pafy."""
-#     if not pafy:
-#         raise RuntimeError("Pafy library is not available.")
-#     try:
-#         logger.info(f"Pafy: Creating video object for {youtube_url}")
-#         video = pafy.new(youtube_url)
-
-#         logger.info(f"Pafy: Getting best audio stream for '{video.title}'")
-#         best_audio = video.getbestaudio()
-#         if not best_audio:
-#             logger.error("Pafy: No suitable audio stream found.")
-#             raise ValueError("Pafy could not find any audio stream for this video.")
-
-#         # Define target filename within temp_dir
-#         # Use a generic name + pafy's extension
-#         download_filename = f"youtube_audio_download.{best_audio.extension}"
-#         download_filepath = os.path.join(temp_dir, download_filename)
-
-#         logger.info(f"Pafy: Downloading audio stream {best_audio.bitrate} {best_audio.extension} to {download_filepath}")
-#         # filepath arg directs the download location
-#         actual_filepath = best_audio.download(filepath=download_filepath, quiet=True) # quiet=True suppresses console progress
-#         logger.info(f"Pafy: Download complete. File saved at: {actual_filepath}")
-
-#         # Sometimes pafy might return a slightly different path/filename than requested, use the returned one
-#         if not os.path.exists(actual_filepath):
-#              logger.error(f"Pafy download reported success but file not found at {actual_filepath}")
-#              # Check original path too just in case
-#              if os.path.exists(download_filepath):
-#                  logger.warning(f"Pafy download found at requested path {download_filepath} despite returning different path.")
-#                  return download_filepath
-#              raise FileNotFoundError("Downloaded file not found after pafy download.")
-
-#         return actual_filepath # Return the path where the file was actually saved
-
-#     except (ValueError, IOError, OSError, KeyError, AttributeError) as e: # Catch common pafy/download issues
-#         # Pafy doesn't have super specific exceptions documented well, catch broad categories
-#         logger.error(f"Pafy: Error processing URL {youtube_url}: {e}", exc_info=True)
-#         # Check if it looks like a 4xx error (like 404 Not Found, 403 Forbidden)
-#         if "HTTP Error 4" in str(e):
-#              raise ValueError(f"Video not found or access denied ({type(e).__name__}: {e})") # Raise specific error type if possible
-#         raise RuntimeError(f"Pafy failed to process video/download audio: {type(e).__name__}: {e}")
-#     except Exception as e: # Catch any other unexpected error
-#          logger.error(f"Pafy: Unexpected error for {youtube_url}: {e}", exc_info=True)
-#          raise RuntimeError(f"Unexpected error during Pafy download: {type(e).__name__}: {e}")
 
 
 # --- Pydantic Models ---
@@ -331,9 +268,29 @@ class TranslationRequest(BaseModel):
     text: str
     target_language: str
 
-# class YouTubeTranscribeRequest(BaseModel):
-#     youtube_url: str
-#     # Future: add language hint, model choice etc.
+class YouTubeTranscribeRequest(BaseModel):
+    youtube_url: HttpUrl # Use Pydantic's HttpUrl for basic validation
+
+    # Add a validator to be more specific about YouTube URLs
+    @field_validator('youtube_url')
+    @classmethod
+    def check_youtube_url(cls, value: HttpUrl):
+        host = value.host.lower() if value.host else ''
+        is_youtube_domain = host == 'youtube.com' or \
+                              host == 'www.youtube.com' or \
+                              host == 'm.youtube.com' or \
+                              host == 'youtu.be'
+        if not is_youtube_domain:
+            raise ValueError('URL must be a valid YouTube domain (youtube.com, youtu.be)')
+        # Basic structure check (can be enhanced)
+        if host == 'youtu.be' and (value.path is None or len(value.path) <= 1):
+             raise ValueError('youtu.be URL must have a video ID path')
+        if 'youtube.com' in host and value.path != '/watch' and not value.path.startswith('/shorts/') and not value.path.startswith('/embed/'):
+             # Allow query param 'v' even if path isn't exactly /watch (less strict)
+             if 'v' not in value.query_params:
+                  raise ValueError('youtube.com URL must be a watch, shorts, or embed link with video ID')
+        return value
+
 class QuestionGenerationRequest(BaseModel):
     transcript: str = Field(..., description="The transcribed text from the audio.")
     num_questions: int = Field(default=7, ge=3, le=15, description="Approximate number of questions to generate.")
@@ -355,9 +312,11 @@ async def api_root():
     })
 
 @app.post("/api/transcribe", tags=["Transcription"])
-async def transcribe_video(file: UploadFile = File(...)):
+async def transcribe_video(file: Optional[UploadFile] = File(None), payload: Optional[YouTubeTranscribeRequest] = Body(None)):
     """
-    Receives video, extracts audio via MoviePy, transcribes via Gemini.
+    Transcribes video/audio from either a FILE UPLOAD or a YOUTUBE URL.
+    Requires EITHER 'file' (multipart/form-data) OR 'youtube_url' (application/json).
+    Returns transcription as a JSON string with timestamps.
     """
     if not genai or not gemini_model: raise HTTPException(status_code=501, detail="Gemini API not configured.")
     if not mp:
@@ -367,75 +326,94 @@ async def transcribe_video(file: UploadFile = File(...)):
          raise HTTPException(status_code=400, detail="No filename provided.")
 
     # Use a temporary directory for robust cleanup
-    temp_dir_obj = tempfile.TemporaryDirectory(prefix="api_upload_")
-    temp_dir = temp_dir_obj.name
-    logger.info(f"Created temporary directory: {temp_dir}")
+    source_description = "Unknown"
+    transcription_json = None
+    if file and payload:
+         raise HTTPException(status_code=400, detail="Provide EITHER a file upload OR a youtube_url in the body, not both.")
+    if file:
+        if not file.filename:
+             raise HTTPException(status_code=400, detail="No filename provided with file upload.")
+        if not mp:
+             raise HTTPException(status_code=501, detail="MoviePy library (for file processing) not available.")
 
-    try:
-        safe_filename = Path(file.filename).name
-        video_path = os.path.join(temp_dir, safe_filename)
-        base_name, _ = os.path.splitext(safe_filename)
-        # Use a simple name for the single extracted audio file
-        audio_filename = f"{base_name}_extracted_audio.wav"
-        audio_path = os.path.join(temp_dir, audio_filename)
+        source_description = f"File: {file.filename}"
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix="api_upload_")
+        temp_dir = temp_dir_obj.name
+        logger.info(f"Created temporary directory for file upload: {temp_dir}")
+        audio_path = None # Path to extracted audio
 
-        # 1. Save uploaded video file temporarily
-        logger.info(f"Saving uploaded video to: {video_path}")
         try:
-            with open(video_path, "wb") as buffer:
-                while chunk := await file.read(8192): buffer.write(chunk)
-            logger.info(f"Successfully saved video file: {video_path}")
-        except Exception as e:
-            logger.error(f"Failed to save uploaded file: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Could not save uploaded file.")
-        finally:
-            await file.close() # Ensure stream is closed
+            # Save video temporarily
+            safe_filename = Path(file.filename).name
+            video_path = os.path.join(temp_dir, safe_filename)
+            logger.info(f"Saving uploaded video to: {video_path}")
+            try:
+                with open(video_path, "wb") as buffer:
+                    while chunk := await file.read(8192): buffer.write(chunk)
+            except Exception as e:
+                logger.error(f"Failed to save uploaded file: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Could not save uploaded file.")
+            finally:
+                await file.close()
 
-        # 2. Extract audio using MoviePy
-        logger.info(f"Extracting audio using MoviePy to: {audio_path}")
-        try:
+            # Extract audio
+            base_name, _ = os.path.splitext(safe_filename)
+            audio_filename = f"{base_name}_extracted_audio.wav"
+            audio_path = os.path.join(temp_dir, audio_filename)
+            logger.info(f"Extracting audio using MoviePy to: {audio_path}")
             await extract_audio_moviepy(video_path, audio_path)
-        except (RuntimeError, ValueError) as e:
-            raise HTTPException(status_code=500, detail=f"Audio extraction failed: {e}")
+
+            # Transcribe extracted audio
+            if not os.path.exists(audio_path):
+                 raise HTTPException(status_code=500, detail="Audio extraction did not produce a file.")
+            logger.info(f"Starting transcription for extracted audio: {audio_path}")
+            transcription_json = await transcribe_via_gemini(audio_path, is_youtube_uri=False)
+
+        except (RuntimeError, ValueError, HTTPException) as e:
+             # Catch specific errors from helpers or explicit HTTP exceptions
+             detail = getattr(e, 'detail', str(e)) # Get detail if HTTPException
+             status_code = getattr(e, 'status_code', 500) # Get status if HTTPException
+             logger.error(f"Error processing file upload: {detail}")
+             raise HTTPException(status_code=status_code, detail=detail)
         except Exception as e:
-            logger.error(f"Unexpected error during audio extraction: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Audio extraction failed unexpectedly.")
+             logger.error(f"Unexpected error processing file upload: {e}", exc_info=True)
+             raise HTTPException(status_code=500, detail="Internal error during file processing.")
+        finally:
+            logger.info(f"Cleaning up temporary directory: {temp_dir}")
+            temp_dir_obj.cleanup()
 
-        # 3. Transcribe the extracted audio file
-        if not os.path.exists(audio_path):
-             logger.error(f"Audio file missing after extraction: {audio_path}")
-             raise HTTPException(status_code=500, detail="Audio extraction did not produce a file.")
+    # --- Handle YouTube URL ---
+    elif payload and payload.youtube_url:
+         # Pydantic already performed basic + custom validation
+         source_description = f"YouTube URL: {payload.youtube_url}"
+         youtube_uri = str(payload.youtube_url) # Convert HttpUrl back to string for Gemini
+         try:
+             logger.info(f"Starting transcription for YouTube URL: {youtube_uri}")
+             # Directly pass the validated URL string to the Gemini helper
+             transcription_json = await transcribe_via_gemini(youtube_uri, is_youtube_uri=True)
+         except RuntimeError as e: # Catch errors from transcribe_via_gemini
+              logger.error(f"Error processing YouTube URL: {e}")
+              # Decide status code based on error type if possible (e.g., 404, 403 from Gemini)
+              raise HTTPException(status_code=503, detail=f"Transcription service failed: {e}")
+         except Exception as e:
+              logger.error(f"Unexpected error processing YouTube URL: {e}", exc_info=True)
+              raise HTTPException(status_code=500, detail="Internal error during YouTube processing.")
 
-        logger.info(f"Starting transcription for: {audio_path}")
-        transcription = await transcribe_audio_gemini(audio_path)
+    # --- No Input Provided ---
+    else:
+        raise HTTPException(status_code=400, detail="No input provided. Send either a 'file' upload or a JSON body with 'youtube_url'.")
 
-        # Check if transcription returned an error message
-        if transcription.startswith("Error:"):
-            logger.warning(f"Transcription failed with message: {transcription}")
-            # Return 502 Bad Gateway if the external service failed, 400 if audio was bad
-            status_code = 503 if "quota" in transcription.lower() or "permission" in transcription.lower() else \
-                          400 if "blocked" in transcription.lower() else 500 # Default internal error
-            raise HTTPException(status_code=status_code, detail=transcription)
-
-        logger.info("Transcription successful.")
-
-        # 4. Return the result
+    # --- Return Result ---
+    if transcription_json:
+        logger.info(f"Transcription successful for {source_description}.")
+        # Return raw JSON string, Flutter will parse it
         return JSONResponse(content={
-            "filename": file.filename,
-            "content_type": file.content_type,
-            "transcription": transcription,
+            "transcription_json": transcription_json, # Key name indicates JSON content
             "engine": "Google Gemini"
         })
-
-    except HTTPException:
-        raise # Re-raise exceptions we already handled
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in transcribe_video endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
-    finally:
-        # Cleanup temporary directory
-        logger.info(f"Cleaning up temporary directory: {temp_dir}")
-        temp_dir_obj.cleanup()
+    else:
+        # Should have been caught by exceptions, but as a fallback
+        raise HTTPException(status_code=500, detail="Transcription failed for unknown reasons.")
 
 @app.post("/api/translate", tags=["Translation"])
 async def translate_text_gemini(payload: TranslationRequest):
